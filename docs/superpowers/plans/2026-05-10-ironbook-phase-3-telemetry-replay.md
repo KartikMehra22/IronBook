@@ -552,13 +552,93 @@ impl telemetry_ingester_server::TelemetryIngester for Ingester {
     }
 }
 
-fn to_row(ev: &TelemetryEvent) -> crate::sink_clickhouse::RunsRawRow { /* map fields */ todo_map(ev) }
-fn todo_map(_ev: &TelemetryEvent) -> crate::sink_clickhouse::RunsRawRow { unimplemented!("complete in step 5") }
+fn to_row(ev: &TelemetryEvent) -> crate::sink_clickhouse::RunsRawRow {
+    use crate::sink_clickhouse::RunsRawRow;
+    let order = ev.order.as_ref();
+    let ack   = ev.ack.as_ref();
+
+    // Map proto enums (i32) to ClickHouse enum8 byte values per the schema in T13.2.
+    let event_kind: u8 = match ev.event_kind() {
+        EventKind::EkOrder       => 1,
+        EventKind::EkAck         => 2,
+        EventKind::EkFill        => 3,
+        EventKind::EkCancel      => 4,
+        EventKind::EkDivergence  => 5,
+        EventKind::EkUnspecified => 1, // default to "order"
+    };
+    let side: u8 = match order.and_then(|o| Side::try_from(o.side).ok()) {
+        Some(Side::Bid) => 1,
+        Some(Side::Ask) => 2,
+        _               => 1,
+    };
+    let order_type: u8 = match order.and_then(|o| OrderType::try_from(o.order_type).ok()) {
+        Some(OrderType::Limit)  => 1,
+        Some(OrderType::Market) => 2,
+        _                       => 1,
+    };
+    let tif: u8 = match order.and_then(|o| TimeInForce::try_from(o.tif).ok()) {
+        Some(TimeInForce::Gtc) => 1,
+        Some(TimeInForce::Ioc) => 2,
+        Some(TimeInForce::Fok) => 3,
+        _                      => 1,
+    };
+
+    // Fixed-size byte arrays — pad/truncate if proto bytes are wrong length.
+    let run_id: [u8; 16] = ev.run_id.as_slice().try_into().unwrap_or([0u8; 16]);
+    let coid:   u128     = order
+        .map(|o| {
+            let arr: [u8; 16] = o.client_order_id.as_slice().try_into().unwrap_or([0u8; 16]);
+            u128::from_be_bytes(arr)
+        })
+        .unwrap_or(0);
+    let session_token: [u8; 32] = order
+        .map(|o| o.session_token.as_slice().try_into().unwrap_or([0u8; 32]))
+        .unwrap_or([0u8; 32]);
+
+    // Pad sha fields (proto carries hex string OR 32 raw bytes; spec says hex string of length 64).
+    let mut sub_sha = [b'0'; 64];
+    sub_sha.copy_from_slice(&pad_to_64(&ev.submission_sha256));
+    let mut scn_hash = [b'0'; 64];
+    scn_hash.copy_from_slice(&pad_to_64(&ev.scenario_hash));
+
+    let fills: Vec<(u64, u64, i64, u64)> = ev.fills.iter()
+        .map(|f| (f.trade_id, f.platform_seq_maker, f.price, f.qty))
+        .collect();
+
+    let divergence_kind: u8 = 1; // "match"; divergence-detector emits dedicated DivergenceEvents instead.
+
+    RunsRawRow {
+        run_id,
+        platform_seq:   ev.platform_seq,
+        platform_ts:    ev.platform_ts_ns,
+        event_kind,
+        client_order_id: coid,
+        session_token,
+        side,
+        qty:            order.map(|o| o.qty).unwrap_or(0),
+        price:          order.map(|o| o.price).unwrap_or(0),
+        order_type,
+        tif,
+        in_ts_ns:       ev.in_ts_ns,
+        ack_ts_ns:      ack.map(|a| a.ack_ts_ns).unwrap_or(ev.ack_ts_ns),
+        fills,
+        divergence_kind,
+        submission_sha256: sub_sha,
+        scenario_hash:     scn_hash,
+    }
+}
+
+fn pad_to_64(input: &[u8]) -> Vec<u8> {
+    let mut out = vec![b'0'; 64];
+    let n = input.len().min(64);
+    out[..n].copy_from_slice(&input[..n]);
+    out
+}
 ```
 
 (Add the `TelemetryIngester` service to `proto/ironbook/v1/telemetry.proto` with `rpc Ingest(TelemetryBatch) returns (google.protobuf.Empty);`. Run `buf generate`.)
 
-- [ ] **Step 5: Implement `to_row` field-by-field** following the `runs_raw` schema. Treat empty fields as zeros; map `EK_*` enum → `event_kind` int; map fills tuple-by-tuple.
+- [ ] **Step 5: Verify the row-mapping compiles** — `cargo build -p telemetry-ingester` should be clean.
 
 - [ ] **Step 6: `main.rs`**
 
@@ -646,6 +726,110 @@ Replace `gateway.NewFileSink(logPath)` with `sink`.
 ```bash
 git add apps/fairness-gateway/
 git commit -m "feat(fairness-gateway): replace FileSink with RedpandaSink (per-run topic)"
+```
+
+---
+
+### Task 14.5: bot-worker (Rust, async REST/WS over rdkafka claims)
+
+**Files:**
+- Replace: `crates/bot-worker/src/main.rs`
+- Modify: `crates/bot-worker/Cargo.toml`
+
+The Phase 2 `bot-coordinator` does Go-side direct REST dispatch. For higher sustained TPS (≥ 5k orders/s) the dispatch needs to fan out to multiple Rust workers consuming from a Redpanda `runs.<id>.dispatch` topic. KEDA autoscales the Deployment by consumer-group lag.
+
+- [ ] **Step 1: Cargo.toml**
+
+```toml
+[package]
+name        = "bot-worker"
+version     = "0.0.1"
+edition.workspace = true
+[dependencies]
+tokio    = { workspace = true }
+rdkafka  = "0.36"
+reqwest  = { version = "0.12", features = ["json"] }
+serde    = { workspace = true }
+serde_json = { workspace = true }
+anyhow   = { workspace = true }
+[lints]
+workspace = true
+```
+
+- [ ] **Step 2: `src/main.rs`**
+
+```rust
+use rdkafka::{config::ClientConfig, consumer::{Consumer, StreamConsumer}, Message};
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct DispatchEvent {
+    bot_id: u64, local_seq: u64,
+    side: String, qty: u64, price: i64,
+    order_type: String, tif: String,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let brokers = std::env::var("REDPANDA_BROKERS")?;
+    let topic   = std::env::var("REDPANDA_TOPIC")?; // runs.<id>.dispatch
+    let gateway = std::env::var("GATEWAY_URL")?;
+    let group   = std::env::var("CONSUMER_GROUP").unwrap_or_else(|_| "bot-workers".into());
+
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &brokers)
+        .set("group.id", &group)
+        .set("enable.auto.commit", "true")
+        .set("auto.offset.reset", "earliest")
+        .create()?;
+    consumer.subscribe(&[&topic])?;
+
+    let http = reqwest::Client::builder().pool_max_idle_per_host(64).build()?;
+
+    loop {
+        let msg = consumer.recv().await?;
+        let Some(payload) = msg.payload() else { continue };
+        let Ok(ev) = serde_json::from_slice::<DispatchEvent>(payload) else { continue };
+        let body = serde_json::json!({
+            "bot_id": ev.bot_id, "local_seq": ev.local_seq,
+            "side": ev.side, "qty": ev.qty, "price": ev.price,
+            "order_type": ev.order_type, "tif": ev.tif,
+        });
+        // Fire-and-forget; the gateway is the latency truth source.
+        let _ = http.post(format!("{gateway}/v1/order")).json(&body).send().await;
+    }
+}
+```
+
+- [ ] **Step 3: Modify `bot-coordinator` to publish to the dispatch topic instead of POSTing directly** when env `DISPATCH_VIA_REDPANDA=true`. Otherwise keep direct-REST behaviour for low-rate scenarios.
+
+- [ ] **Step 4: KEDA ScaledObject**
+
+`deploy/manifests/base/bot-worker/scaledobject.yaml`:
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata: { name: bot-worker, namespace: ironbook }
+spec:
+  scaleTargetRef: { name: bot-worker }
+  minReplicaCount: 1
+  maxReplicaCount: 8
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: redpanda.ironbook.svc:9092
+        consumerGroup: bot-workers
+        topic: runs.dispatch  # NB: across-runs trigger; per-run topics aggregate via consumer pattern
+        lagThreshold: "100"
+```
+
+(KEDA itself installs via Helm or upstream YAML; add a `deploy/manifests/base/keda/` directory if not already present.)
+
+- [ ] **Step 5: Manifest, build, commit**
+
+```bash
+git add crates/bot-worker/ apps/bot-coordinator/ deploy/manifests/base/bot-worker/
+git commit -m "feat(bot-worker): Rust async dispatcher consuming Redpanda dispatch topic; KEDA autoscale on lag"
 ```
 
 ---
@@ -943,19 +1127,75 @@ git commit -m "feat(replay-format): Parquet schema + zstd-compressed writer with
 ```rust
 use parquet::arrow::ParquetRecordBatchReaderBuilder;
 
+#[derive(Clone, Debug)]
+pub struct ReplayEvent {
+    pub platform_seq:   u64,
+    pub platform_ts_ns: u64,
+    pub run_id:         [u8; 16],
+    pub client_order_id: [u8; 16],
+    pub session_token:  [u8; 32],
+    pub op:             i32, // 0=NEW 1=CANCEL 2=AMEND
+    pub side:           i32,
+    pub qty:            u64,
+    pub price:          i64,
+    pub order_type:     i32,
+    pub tif:            i32,
+    pub wire_format:    i32,
+}
+
 pub fn read_events(path: &std::path::Path) -> anyhow::Result<Vec<ReplayEvent>> {
     let file = std::fs::File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let mut reader = builder.build()?;
+    let reader = builder.build()?;
     let mut out = Vec::new();
-    while let Some(batch) = reader.next() {
+    for batch in reader {
         let batch = batch?;
-        // extract columns into ReplayEvent struct (omit verbose code)
-        out.extend(decode_batch(&batch));
+        out.extend(decode_batch(&batch)?);
     }
     Ok(out)
 }
-fn decode_batch(b: &arrow::record_batch::RecordBatch) -> Vec<ReplayEvent> { unimplemented!() }
+
+fn decode_batch(b: &arrow::record_batch::RecordBatch) -> anyhow::Result<Vec<ReplayEvent>> {
+    use arrow::array::*;
+    let n = b.num_rows();
+    // Each column ordered exactly as defined in replay-format::replay_schema().
+    let platform_seq    = b.column(0).as_any().downcast_ref::<UInt64Array>().ok_or_else(|| anyhow::anyhow!("col 0"))?;
+    let platform_ts     = b.column(1).as_any().downcast_ref::<UInt64Array>().ok_or_else(|| anyhow::anyhow!("col 1"))?;
+    let run_id_arr      = b.column(2).as_any().downcast_ref::<FixedSizeBinaryArray>().ok_or_else(|| anyhow::anyhow!("col 2"))?;
+    let client_oid_arr  = b.column(3).as_any().downcast_ref::<FixedSizeBinaryArray>().ok_or_else(|| anyhow::anyhow!("col 3"))?;
+    let session_tok_arr = b.column(4).as_any().downcast_ref::<FixedSizeBinaryArray>().ok_or_else(|| anyhow::anyhow!("col 4"))?;
+    let op              = b.column(5).as_any().downcast_ref::<Int32Array>().ok_or_else(|| anyhow::anyhow!("col 5"))?;
+    let side            = b.column(6).as_any().downcast_ref::<Int32Array>().ok_or_else(|| anyhow::anyhow!("col 6"))?;
+    let qty             = b.column(7).as_any().downcast_ref::<UInt64Array>().ok_or_else(|| anyhow::anyhow!("col 7"))?;
+    let price           = b.column(8).as_any().downcast_ref::<Int64Array>().ok_or_else(|| anyhow::anyhow!("col 8"))?;
+    let order_type      = b.column(9).as_any().downcast_ref::<Int32Array>().ok_or_else(|| anyhow::anyhow!("col 9"))?;
+    let tif             = b.column(10).as_any().downcast_ref::<Int32Array>().ok_or_else(|| anyhow::anyhow!("col 10"))?;
+    let wire_format     = b.column(11).as_any().downcast_ref::<Int32Array>().ok_or_else(|| anyhow::anyhow!("col 11"))?;
+
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut run_id = [0u8; 16];
+        run_id.copy_from_slice(run_id_arr.value(i));
+        let mut client_order_id = [0u8; 16];
+        client_order_id.copy_from_slice(client_oid_arr.value(i));
+        let mut session_token = [0u8; 32];
+        session_token.copy_from_slice(session_tok_arr.value(i));
+
+        out.push(ReplayEvent {
+            platform_seq:   platform_seq.value(i),
+            platform_ts_ns: platform_ts.value(i),
+            run_id, client_order_id, session_token,
+            op:          op.value(i),
+            side:        side.value(i),
+            qty:         qty.value(i),
+            price:       price.value(i),
+            order_type:  order_type.value(i),
+            tif:         tif.value(i),
+            wire_format: wire_format.value(i),
+        });
+    }
+    Ok(out)
+}
 ```
 
 - [ ] **Step 2: Emitter** — POST each event back through fairness-gateway, **preserving original `platform_seq` + `platform_ts`**

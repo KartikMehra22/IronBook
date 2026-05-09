@@ -2297,7 +2297,7 @@ git commit -m "feat(bot-coordinator): deterministic schedule compiler + REST dis
 
 For Phase 2, the bot-coordinator dispatches directly via REST. A separate `bot-worker` will be introduced in Phase 3 when we move to Redpanda-driven backpressure-aware dispatch + KEDA scaling. Skip in Phase 2.
 
-- [ ] **Step 1: Add `crates/bot-worker` skeleton to keep workspace honest** (real impl Phase 3 T3.6)
+- [ ] **Step 1: Add `crates/bot-worker` skeleton to keep workspace honest** (real impl Phase 3 Task 14.5)
 
 ```bash
 mkdir -p crates/bot-worker/src
