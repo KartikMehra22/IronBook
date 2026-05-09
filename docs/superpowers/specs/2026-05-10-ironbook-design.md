@@ -3,7 +3,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | In progress — Sections 1–3 approved; 4–9 pending |
+| **Status** | Complete — all 9 sections approved; pending user review |
 | **Author** | Kartik Mehra (solo) |
 | **Hackathon** | IICPC Summer Hackathon 2026 (May 9 → June 10, 2026) |
 | **Created** | 2026-05-10 |
@@ -459,7 +459,7 @@ sequenceDiagram
 
 - `crates/matching-engine` (Rust) — order book + matcher, used by `reference-oracle` and as the publishable contestant template
 - `crates/replay-format` (Rust) — Parquet schema + (de)serializer
-- `crates/telemetry-proto` (proto) — generated Go + Rust bindings
+- `crates/proto` (Rust) — generated prost + tonic bindings; `pkg/proto` (Go) — generated protoc-gen-go bindings (both produced from `proto/` IDL via `buf generate`)
 - `pkg/k8s-client` (Go) — thin wrapper on client-go
 - `pkg/cosign-verify` (Go) — cosign sig verification
 
@@ -1291,7 +1291,7 @@ fn on_oracle(state: &mut State, ev: OracleEvent) {
 | `SUB_MISSING` | Submission did not produce an event for an order the gateway sent | -1, availability fail |
 | `ORACLE_MISSING` | Oracle did not produce an event but submission did | Platform bug, not submission; run flagged invalid |
 
-The composite scoring formula in §6 uses `(matches / total)` as `correctness ∈ [0, 1]` as a **gate**: any submission below 0.99 correctness is ineligible to win regardless of latency.
+The composite scoring formula in §6 uses `(matches / total)` as `correctness ∈ [0, 1]` as a **gate**: any submission below 0.999 correctness is ineligible to win regardless of latency.
 
 Watermarking: Redpanda partitions for `submission_out` and `oracle_out` keyed by `run_id`. Within a single `(run_id, partition)`, ordering is preserved. Detector advances a watermark per partition based on the slowest of the two streams; "missing" events are emitted only past the watermark.
 
@@ -2239,31 +2239,524 @@ RUNBOOK-05: A run is "stuck" in PRIMING
 
 ---
 
-## 9. Repo Structure & IaC Layout — PENDING
+## 9. Repo Structure & IaC Layout — APPROVED
 
-> *Planned subsections:*
->
-> 9.1 Monorepo layout (apps/, crates/, deploy/, docs/, tools/)
-> 9.2 Go module organization
-> 9.3 Rust workspace
-> 9.4 Terraform module structure (Hetzner, Cloudflare)
-> 9.5 K8s manifests with Kustomize overlays (dev / prod)
-> 9.6 GitHub Actions CI/CD pipelines
-> 9.7 Argo CD application set
-> 9.8 Demo runbook
+The repository is the platform's blueprint in code. Monorepo, polyglot (Go + Rust + TS + YAML + HCL), with conventions enforced by `make` and `golangci-lint` / `clippy`.
+
+### 9.1 Top-level layout
+
+```
+IronBook/
+├── apps/                      # Go services (one binary per dir)
+│   ├── submission-api/
+│   ├── benchmark-operator/
+│   ├── fairness-gateway/
+│   ├── bot-coordinator/
+│   ├── scoring-engine/
+│   ├── leaderboard-api/
+│   ├── admission-webhook/
+│   ├── build-runner/
+│   ├── chaos-agent/
+│   └── scenario-compiler/
+├── crates/                    # Rust workspace
+│   ├── matching-engine/       # the order book + matcher (also publishable)
+│   ├── reference-oracle/      # gRPC server wrapping matching-engine
+│   ├── telemetry-ingester/
+│   ├── telemetry-sidecar/
+│   ├── divergence-detector/
+│   ├── replay-engine/
+│   ├── time-service/
+│   ├── bot-worker/
+│   ├── ebpf-observer/         # aya-rs userspace + BPF program
+│   ├── replay-format/         # Parquet schema + (de)serializer (lib only)
+│   ├── proto/                 # generated prost + tonic bindings (lib only)
+│   └── ironbookctl/           # CLI: replay, score, etc.
+├── proto/                     # Protobuf IDL + buf config
+│   ├── ironbook/v1/
+│   │   ├── orders.proto
+│   │   ├── telemetry.proto
+│   │   ├── time.proto
+│   │   ├── runs.proto
+│   │   └── divergence.proto
+│   └── buf.yaml
+├── frontend/                  # Next.js dashboard
+│   ├── app/                   # App Router
+│   ├── components/
+│   ├── lib/                   # gRPC-Web client, SSE hooks
+│   └── public/
+├── deploy/                    # IaC — Terraform + K8s manifests + Helm
+│   ├── terraform/
+│   │   ├── modules/
+│   │   │   ├── hetzner-vm/
+│   │   │   ├── cloudflare-tunnel/
+│   │   │   └── wireguard/
+│   │   ├── envs/
+│   │   │   ├── dev/
+│   │   │   └── prod/
+│   │   └── README.md
+│   ├── manifests/             # raw + Kustomize, Argo CD source of truth
+│   │   ├── base/
+│   │   │   ├── ironbook.io_crds/
+│   │   │   ├── cert-manager/
+│   │   │   ├── argocd/
+│   │   │   ├── opa-gatekeeper/
+│   │   │   ├── otel-collector/
+│   │   │   ├── tempo/
+│   │   │   ├── loki/
+│   │   │   ├── prometheus/
+│   │   │   ├── grafana/
+│   │   │   ├── parca/
+│   │   │   ├── redpanda/
+│   │   │   ├── clickhouse/
+│   │   │   ├── postgres/
+│   │   │   ├── redis/
+│   │   │   ├── minio/
+│   │   │   ├── submission-api/
+│   │   │   ├── benchmark-operator/
+│   │   │   ├── fairness-gateway/
+│   │   │   ├── reference-oracle/
+│   │   │   ├── bot-coordinator/
+│   │   │   ├── bot-worker/
+│   │   │   ├── time-service/
+│   │   │   ├── telemetry-ingester/
+│   │   │   ├── divergence-detector/
+│   │   │   ├── replay-engine/
+│   │   │   ├── scoring-engine/
+│   │   │   ├── leaderboard-api/
+│   │   │   ├── admission-webhook/
+│   │   │   ├── build-runner/
+│   │   │   ├── chaos-agent/
+│   │   │   ├── ebpf-observer/
+│   │   │   ├── frontend/
+│   │   │   └── caddy/
+│   │   ├── overlays/
+│   │   │   ├── dev/           # k3d on Mac (Region A)
+│   │   │   ├── prod-control/  # k3d on Mac, prod-tuned
+│   │   │   └── prod-sandbox/  # k3s on Hetzner (Region B)
+│   │   └── argocd-applicationset.yaml
+│   ├── grafana/dashboards/    # JSON dashboards, provisioned by Argo CD
+│   ├── policies/              # OPA Rego, seccomp JSON, AppArmor profiles
+│   ├── runtimeclasses/        # gvisor + native
+│   └── networkpolicies/       # the deny-by-default NetworkPolicies
+├── docs/
+│   ├── superpowers/specs/     # this file
+│   ├── runbooks/              # 5 runbooks from §8.11
+│   ├── adr/                   # Architecture Decision Records
+│   ├── benchmarks/            # benchmark charts + raw data
+│   └── README.md
+├── tests/
+│   └── e2e/
+│       ├── fixtures/submissions/   # 10 fixture submissions from §7.5
+│       ├── scenarios/              # YAML scenarios
+│       └── cases/                  # 12 E2E test cases
+├── tools/
+│   ├── kindcluster/           # one-shot kind cluster creator
+│   ├── seed-data/             # seed scenarios + sample submissions
+│   ├── benchcompare/          # criterion baseline diff helper
+│   └── make-replay/           # generate Parquet replay logs from real runs
+├── templates/                 # public contestant templates (= E2E fixtures)
+├── .github/
+│   └── workflows/
+│       ├── ci.yml
+│       ├── nightly.yml
+│       └── release.yml
+├── Makefile
+├── Cargo.toml                 # virtual workspace
+├── go.mod                     # single Go module rooted here
+├── buf.gen.yaml
+├── flake.nix                  # optional: reproducible dev shell
+├── .editorconfig
+├── .gitignore
+├── LICENSE                    # MIT or Apache-2.0
+└── README.md                  # the elevator pitch + quick-start
+```
+
+The `apps/` ↔ `crates/` split is by language. Each binary gets its own directory; common code lives in `pkg/` (Go) or as workspace member crates.
+
+### 9.2 Go module organization
+
+Single Go module rooted at the repo (`module github.com/<owner>/IronBook`). Per-app layout:
+
+```
+apps/submission-api/
+├── main.go                    # thin: wire-up + run
+├── server/                    # HTTP/gRPC handlers
+├── service/                   # business logic
+├── repo/                      # Postgres / MinIO / Redpanda accessors
+├── config/                    # env-var parsing via envconfig
+├── otel/                      # tracer + meter init helpers
+├── integration/               # *_test.go using Testcontainers
+└── README.md
+```
+
+Shared packages:
+
+```
+pkg/
+├── telemetry/, k8sclient/, cosignverify/, jwtmint/, timeclient/,
+├── redpandaclient/, clickhouseclient/, postgresclient/, miniclient/,
+├── glicko2/, netemctl/, testharness/
+```
+
+Two rules:
+
+1. `main.go` is wiring only. No business logic.
+2. No service-to-service direct imports. Services talk over gRPC.
+
+### 9.3 Rust workspace
+
+Single virtual workspace at the repo root.
+
+```toml
+# Cargo.toml (root)
+[workspace]
+members = [
+  "crates/matching-engine", "crates/reference-oracle", "crates/telemetry-ingester",
+  "crates/telemetry-sidecar", "crates/divergence-detector", "crates/replay-engine",
+  "crates/time-service", "crates/bot-worker", "crates/ebpf-observer",
+  "crates/replay-format", "crates/proto", "crates/ironbookctl",
+]
+resolver = "2"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+tonic = "0.12"
+prost = "0.13"
+serde = { version = "1", features = ["derive"] }
+arrow = "53"
+parquet = "53"
+clickhouse = "0.13"
+opentelemetry = "0.26"
+tracing = "0.1"
+anyhow = "1"
+thiserror = "2"
+crossbeam = "0.8"
+proptest = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+```
+
+`unsafe_code = "forbid"` is the loudest correctness statement we can make. Any unsafe block requires a workspace-level allow-list and a `// SAFETY:` block; CI fails on any violation. The exception is the `ebpf-observer` crate's BPF program code, which is in a separate sub-crate that opts out of the lint.
+
+### 9.4 Protobuf + codegen
+
+```
+proto/ironbook/v1/
+├── orders.proto         # Order, NormalizedOrder, Ack, Fill, Cancel
+├── telemetry.proto      # TelemetryBatch, OrderEvent, AckEvent, FillEvent
+├── time.proto           # NextStampRequest, NextStampResponse
+├── runs.proto           # BenchmarkRun status events
+└── divergence.proto     # DivergenceEvent, MatchEvent
+```
+
+```yaml
+# buf.gen.yaml
+version: v2
+plugins:
+  - { remote: buf.build/protocolbuffers/go,           out: pkg/proto,       opt: [paths=source_relative] }
+  - { remote: buf.build/grpc/go,                      out: pkg/proto,       opt: [paths=source_relative] }
+  - { remote: buf.build/community/neoeinstein-prost,  out: crates/proto/src/gen }
+  - { remote: buf.build/community/neoeinstein-tonic,  out: crates/proto/src/gen }
+```
+
+`make proto` runs `buf generate`; CI gate `make proto && git diff --exit-code`.
+
+### 9.5 Frontend (Next.js)
+
+```
+frontend/
+├── app/
+│   ├── (dashboard)/
+│   │   ├── leaderboard/page.tsx        # default landing
+│   │   ├── runs/[runId]/page.tsx       # run inspector
+│   │   ├── submissions/[sha]/page.tsx  # submission history
+│   │   └── layout.tsx
+│   ├── (admin)/chaos/page.tsx          # the demo theater button
+│   ├── api/                            # Next.js API routes (auth only)
+│   └── layout.tsx
+├── components/{leaderboard,charts,traces,ui}/
+├── lib/{grpc-web.ts, sse.ts, auth.ts, proto/}
+├── styles/, package.json (pnpm), tsconfig.json,
+└── tailwind.config.ts, next.config.mjs
+```
+
+App Router with React Server Components for static parts; small client bundle for the live leaderboard via SSE. Strict TypeScript (`"strict": true`, `"noUncheckedIndexedAccess": true`).
+
+### 9.6 Terraform layout
+
+```
+deploy/terraform/
+├── modules/
+│   ├── hetzner-vm/        # hcloud_server, hcloud_volume, hcloud_firewall
+│   ├── cloudflare-tunnel/ # cloudflare_tunnel + DNS records
+│   └── wireguard/         # generates keys, populates configs
+├── envs/
+│   ├── dev/   # local state, simple
+│   └── prod/  # MinIO-backed S3 state, Postgres advisory lock
+└── README.md
+```
+
+Backend for prod: Terraform state in MinIO (S3 API) on the Mac control plane. Self-hosted, no AWS dependency. Lock via `tflock` Postgres advisory locks.
+
+### 9.7 Kustomize overlays + Argo CD
+
+```
+deploy/manifests/
+├── base/<component>/{kustomization,deployment|statefulset|daemonset,service,configmap,networkpolicy,rbac}.yaml
+├── overlays/
+│   ├── dev/                    # 1-replica, tiny resources
+│   ├── prod-control/           # Mac k3d cluster
+│   └── prod-sandbox/           # Hetzner k3s cluster, gvisor RuntimeClass, deny-egress NetPol
+└── argocd-applicationset.yaml
+```
+
+Argo CD ApplicationSet:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata: { name: ironbook }
+spec:
+  generators:
+    - list:
+        elements:
+          - { cluster: control, server: https://kubernetes.default.svc, overlay: prod-control }
+          - { cluster: sandbox, server: https://hetzner-k3s.internal:6443, overlay: prod-sandbox }
+  template:
+    metadata: { name: 'ironbook-{{cluster}}' }
+    spec:
+      project: ironbook
+      source:
+        repoURL: https://github.com/<owner>/IronBook.git
+        targetRevision: main
+        path: deploy/manifests/overlays/{{overlay}}
+      destination: { server: '{{server}}', namespace: ironbook }
+      syncPolicy:
+        automated: { prune: true, selfHeal: true }
+        syncOptions: [ApplyOutOfSyncOnly=true, ServerSideApply=true]
+```
+
+`git push` to main → Argo CD reconciles both clusters within ~1 minute.
+
+### 9.8 GitHub Actions
+
+```
+.github/workflows/
+├── ci.yml          # PR + push to non-main
+├── nightly.yml     # 03:00 UTC chaos / fuzz / mutation
+└── release.yml     # tag push → build, sign, attest, push images
+```
+
+`ci.yml` runs the DAG from §7.11. Each job has explicit time budgets (lint 1m, unit 3m, property 4m, integration 5m, e2e 15m, bench 5m, ci-gates 3m). Total wall-clock with parallelism: ≤ 12 min.
+
+### 9.9 Makefile
+
+```make
+.PHONY: dev test lint fmt build images deploy-dev deploy-prod \
+        test-unit test-prop test-integ test-e2e bench fuzz \
+        ci-local ci-self-replay proto demo
+
+dev:           ; tools/kindcluster up && make deploy-dev
+build:         ; cargo build --workspace --release && go build ./...
+images:        ; docker buildx bake -f deploy/bake.hcl --push
+deploy-dev:    ; kustomize build deploy/manifests/overlays/dev | kubectl apply -f -
+deploy-prod:   ; argocd app sync ironbook-control ironbook-sandbox
+
+test:          test-unit test-integ
+test-unit:     ; cargo nextest run --workspace && go test ./... -race
+test-prop:     ; PROPTEST_CASES=1024 cargo nextest run --workspace -E 'test(prop_)'
+test-integ:    ; go test -tags=integration ./...
+test-e2e:      ; tools/kindcluster up && go test -tags=e2e ./tests/e2e/...
+bench:         ; cargo bench --workspace
+fuzz:          ; cd crates/matching-engine && cargo fuzz run match -- -max_total_time=30
+ci-local:      ; make lint test-unit test-prop test-integ bench
+ci-self-replay:; tools/make-replay --self-replay-check
+
+lint:          ; cargo clippy --workspace -- -D warnings && golangci-lint run
+fmt:           ; cargo fmt --all && gofmt -w . && dprint fmt
+proto:         ; buf generate
+
+demo:          ## end-to-end demo on a fresh laptop
+	@echo "1/5 spinning kind + Hetzner..."  && make dev
+	@echo "2/5 uploading sample submissions..." && tools/seed-data --templates
+	@echo "3/5 running 3 scenarios..." && tools/seed-data --runs 3
+	@echo "4/5 opening dashboard..." && open http://localhost:8080
+	@echo "5/5 done. Try the chaos button on /admin/chaos"
+```
+
+`make demo` is the most important target. A judge typing `make demo` and seeing the full pipeline come up in 5 minutes is the highest-leverage thing in the entire repo.
+
+### 9.10 Branching, commits, ADRs
+
+- Branching: trunk-based; `main` always green; feature branches < 1 day; squash-merge.
+- Commits: Conventional Commits (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`).
+- ADRs in `docs/adr/NNN-decision-name.md`: Context / Decision / Consequences / Alternatives.
+
+Ten ADRs to write early:
+
+```
+docs/adr/
+├── 001-gvisor-not-firecracker.md
+├── 002-redpanda-not-kafka.md
+├── 003-clickhouse-not-timescaledb.md
+├── 004-rust-for-hot-path-go-for-rest.md
+├── 005-two-region-not-single-region.md
+├── 006-glicko-2-not-elo-not-pure-tps.md
+├── 007-content-addressing-replay-logs.md
+├── 008-gateway-stamps-dont-trust-submission.md
+├── 009-correctness-as-gate-not-weight.md
+└── 010-sealed-secrets-not-vault.md
+```
+
+Ten ADRs at ~300 words each = 3000 words of "deliberate, well-reasoned architectural thought process" — the exact phrase the hackathon brief uses.
+
+### 9.11 Local bootstrap
+
+```
+$ git clone https://github.com/<owner>/IronBook.git && cd IronBook
+$ ./scripts/check-prereqs.sh    # Docker, kubectl, kind, cargo, go, pnpm, terraform
+$ make proto                     # generate Go + Rust protobuf bindings
+$ make build
+$ make dev                       # creates kind cluster, deploys ironbook
+$ make demo                      # uploads templates, runs 3 scenarios, opens dashboard
+```
+
+`make dev` does:
+1. `tools/kindcluster up` — 3-node kind cluster with gVisor RuntimeClass and seccomp profile mounted.
+2. Installs cert-manager, OPA Gatekeeper, Argo CD via base manifests.
+3. Bootstraps Argo CD pointed at this checkout (`localhost:8080`).
+4. Waits for all `Application`s to sync.
+5. Prints the dashboard URL.
+
+For Region B simulation in `dev`: a second kind cluster (`ironbook-sandbox`) and a Wireguard mesh between them via two `wg-quick` configs Terraform-generated.
+
+### 9.12 Demo runbook (`docs/demo.md`)
+
+```
+0:00–0:30  Open README.md + run `make demo` on a fresh laptop.
+           Show the topology diagram while it boots.
+
+0:30–1:30  Dashboard opens; live leaderboard already populated by templates.
+           Click on `rust-correct` → run inspector.
+           Show: latency CDF, distributed trace tree, Parca flame graph,
+           Glicko rating with uncertainty.
+
+1:30–2:30  Upload a hostile submission via the UI:
+             tests/e2e/fixtures/submissions/malicious-egress/
+           It builds and deploys (egress is blocked at runtime, not build).
+           Run a scenario against it.
+           Watch:
+             • iptables block counter rising
+             • anti-cheat penalty climbing
+             • score = 0 (correctness gate failed because no acks)
+
+2:30–3:30  Press the chaos button: "Inject network loss 10%".
+           Watch: p99 spike, CDF widen, leaderboard re-sort, Glicko
+           volatility grow. Press "Restore network": score recovers.
+
+3:30–4:30  Show two-region story:
+             kubectl --context=control get br
+             kubectl --context=sandbox get pods
+             wg show
+             cross-Internet RTT in Grafana "Platform Health"
+           Demonstrate replay:
+             ironbookctl replay --run <id> --target <new-submission-sha>
+           Side-by-side scores from byte-identical input.
+
+4:30–5:00  Show docs/superpowers/specs/ — this design doc.
+           Show docs/adr/ — ten ADRs.
+           Close with: "Every number on the leaderboard is five clicks
+           from the order that produced it."
+```
+
+### 9.13 README.md (the elevator)
+
+```markdown
+# IronBook
+A distributed benchmarking and hosting platform for trading infrastructure.
+Submissions in C++, Rust, or Go are securely hosted, stress-tested by a
+distributed bot fleet, and ranked on a live leaderboard scored by latency,
+throughput, and a divergence-tested correctness oracle.
+
+## Why this is unusual
+- A reference matching engine runs in parallel with every submission as the
+  correctness oracle; live divergence detection on the leaderboard.
+- All inputs are content-addressed and replayable — A/B comparisons of two
+  submissions on byte-identical input are one CLI command.
+- Two-region architecture (Mac control plane via k3d ↔ Hetzner sandbox
+  region via k3s) connected by Wireguard, all under €15/month.
+- gVisor + seccomp + AppArmor + cgroups v2 + NetworkPolicy + iptables —
+  seven concentric layers of submission isolation.
+- Glicko-2 ratings with uncertainty bands; multi-scenario tournaments
+  instead of single-run wins.
+- Self-replay byte-equality CI gate proves the input pipeline is
+  deterministic.
+
+## Quickstart
+make dev
+make demo
+
+5 minutes from `git clone` to a live leaderboard. See docs/demo.md.
+
+## Architecture
+docs/superpowers/specs/2026-05-10-ironbook-design.md.
+ADRs in docs/adr/. Runbooks in docs/runbooks/.
+```
+
+### 9.14 Out of scope
+
+- Multi-tenancy at the org level. Single-namespace `ironbook` with single-tenant assumptions.
+- PR preview environments. Dev cluster is shared; per-branch app generation is future work.
+- Bazel / nix build everything. `flake.nix` is optional dev-shell parity; we don't go full nix or Bazel.
+- Public package publishing of `crates/matching-engine`. Documented as publishable; we don't push to crates.io for the hackathon.
 
 ---
 
-## 10. Future Work — PENDING
+## 10. Future Work
 
-> *To be expanded; placeholder list:*
->
-> - Firecracker microVM runtime class (when bare-metal is available)
-> - Multi-region cloud with DNS failover
-> - WASM execution mode for ironclad cross-arch isolation
-> - Service mesh (Linkerd preferred over Istio) at >50 services
-> - Sharded Redpanda + ClickHouse for >100k orders/sec
-> - ML-based anomaly detection on order flow
+Consolidated from the "Out of scope" subsection of each preceding section. Captured here as a single reading so a judge can see the trajectory beyond the prototype without trawling 9 sections.
+
+### 10.1 Sandbox & runtime
+- **Firecracker microVM runtime class.** Adds VM-level isolation; requires KVM-capable bare metal. Slot in as a third `RuntimeClass` next to `gvisor` and `runc`. (§4.9)
+- **WASM execution mode.** Ironclad cross-architecture isolation for submissions willing to compile to WASI. Plug-point already exists at the runtime-class layer. (§1.5)
+
+### 10.2 Scale & topology
+- **Multi-region sandbox** with DNS failover (Hetzner FRA + HEL). Operator-managed scheduling across regions; sub-pod Anti-Affinity by region. (§1.5, §8.12)
+- **Sharded Redpanda + ClickHouse** for > 100 k orders / s. Currently single-broker / single-node; the blueprint sections document how the partitioning would extend. (§3.11)
+- **Service mesh (Linkerd preferred over Istio)** at > 50 services. Today's mTLS-via-cert-manager pattern works; adding mesh becomes worth it past ~50 services where uniform observability outweighs the operational cost. (§1.5)
+
+### 10.3 Correctness & scoring
+- **Consensus oracle mode.** Run two independent matching-engine implementations; require agreement to count an event as ground truth. Defends against an oracle bug penalising all submissions. (§5.7.5)
+- **Cross-symbol matching.** Today single-symbol books; multi-symbol requires per-symbol partition keys throughout the pipeline. (§5.8)
+- **Auction sessions** (NYSE-style opening / closing). Distinct matching algorithm; behind a `MatchMode` enum on `Scenario`. (§5.8)
+- **Pro-rata / size-priority matching.** Toggle on `Scenario.matchPolicy`. (§5.8)
+- **Hidden / iceberg orders.** Adds a hidden-quantity field on the order book. (§5.8)
+- **Market data dissemination protocol** (ITCH-style L2/L3 feed). Today submissions get fills/acks back; broadcasting full market depth is future work. (§5.8)
+
+### 10.4 Security & supply chain
+- **Hardware Security Modules (HSM)** for cosign signing keys. Sealed-secrets is honest at hackathon scale; HSM is the production path. (§4.9)
+- **Public Sigstore Rekor transparency log.** Today we use Sigstore tooling with private CA; public Rekor is the production transparency story. (§4.9)
+- **Trivy in adversarial-fuzzing mode.** Per-submission fuzzing instead of CVE-only scans; unbounded compute today. (§4.9)
+- **Full CIS Benchmark adoption** on the cluster. Adopted relevant controls; full benchmark is future work. (§4.9)
+
+### 10.5 Observability & ML
+- **ML-based anomaly detection** on order flow (e.g., autoencoder on per-second feature vectors). Today rule-based anti-cheat; ML adds detection of novel cheat patterns. (§4.9, §6.11)
+- **SLO error-budget burn-rate dashboards** in Grafana. Metrics already in Prometheus; the dashboard is the missing piece. (§6.11)
+- **Adaptive sampling.** Today rule-based tail-sampling; ML-driven sampling that learns interesting traces is future work. (§6.11)
+
+### 10.6 Repo & ops
+- **Multi-tenancy at the org level.** Today single-namespace `ironbook` with single-tenant assumptions. (§9.14)
+- **PR preview environments.** Per-branch Argo CD ApplicationSet generation. (§9.14)
+- **Public publish of `crates/matching-engine`** to crates.io. Documented as publishable; not pushed for the hackathon. (§9.14)
+- **Active/active hot standby** of platform components beyond operator leader/standby. (§8.12)
+- **Automated backup-and-restore drills.** Daily PG dumps + weekly MinIO mirror exist; game-day exercises are future work. (§8.12)
 
 ---
 
