@@ -1424,18 +1424,329 @@ CI step `make ci-self-replay` runs scenario X twice (live then replay), captures
 
 ---
 
-## 6. Observability & Scoring — PENDING
+## 6. Observability & Scoring — APPROVED
 
-> *Planned subsections:*
->
-> 6.1 OpenTelemetry pipeline (traces / metrics / logs)
-> 6.2 Per-order distributed traces (bot → gateway → submission → ack)
-> 6.3 Histograms (per-symbol, per-side, per-order-type)
-> 6.4 Continuous profiling (Parca, eBPF-backed)
-> 6.5 ClickHouse schema (runs_raw, runs_per_sec, runs_summary)
-> 6.6 Composite scoring formula
-> 6.7 Glicko-2 rating across scenarios
-> 6.8 Anti-cheat scoring signals
+The platform is transparent — every order has a distributed trace; every CPU cycle is profiled; every score decomposes into auditable components. Five clicks from "the number on the leaderboard" to "the order that produced it."
+
+### 6.1 OpenTelemetry pipeline
+
+```mermaid
+flowchart LR
+    subgraph regionB["Region B (Hetzner) — emitters"]
+        gw["fairness-gateway"] -->|OTLP gRPC| col_b
+        sub["submission pod<br/>via sidecar"] -->|OTLP| col_b
+        oracle["reference-oracle"] -->|OTLP| col_b
+        ebpf["ebpf-observer"] -->|OTLP| col_b
+        coord["bot-coordinator"] -->|OTLP| col_b
+        worker["bot-worker"] -->|OTLP| col_b
+        col_b["OTel Collector<br/>DaemonSet (B)"]
+    end
+
+    subgraph regionA["Region A (Mac) — backends"]
+        col_a["OTel Collector<br/>Deployment (A)<br/>tail-sampler"]
+        api["submission-api / operator /<br/>scoring-engine / leaderboard-api"] -->|OTLP| col_a
+        ti["telemetry-ingester"] -->|OTLP| col_a
+        div["divergence-detector"] -->|OTLP| col_a
+        col_a --> tempo[("Tempo<br/>traces, 7d")]
+        col_a --> prom[("Prometheus<br/>metrics, 30d")]
+        col_a --> loki[("Loki<br/>logs, 7d")]
+        col_a --> graf[Grafana]
+        col_a --> alert[Alertmanager]
+    end
+
+    col_b -->|OTLP / WG mTLS<br/>batched| col_a
+```
+
+**Two-tier collector design**: Region B is a low-overhead DaemonSet that batches; Region A applies tail-sampling. Any trace with a divergence event, an error, or a > 5 ms span is retained at 100%; everything else samples at 1%.
+
+```yaml
+processors:
+  tail_sampling:
+    decision_wait: 10s
+    num_traces: 100000
+    expected_new_traces_per_sec: 50000
+    policies:
+      - { name: errors_always,      type: status_code,        status_code: { status_codes: [ERROR] } }
+      - { name: divergences_always, type: string_attribute,   string_attribute: { key: ironbook.divergence, values: ["true"] } }
+      - { name: latency_outliers,   type: latency,            latency: { threshold_ms: 5 } }
+      - { name: random_sample,      type: probabilistic,      probabilistic: { sampling_percentage: 1 } }
+```
+
+### 6.2 Per-order distributed tracing
+
+Span tree per order:
+
+```
+trace: order-{client_order_id}-{platform_seq}
+└── bot.send                                      (bot-worker)
+    └── gateway.receive                            (fairness-gateway)
+        └── gateway.stamp
+        └── gateway.fork
+            ├── submission.handle                  (submission via sidecar)
+            │   ├── submission.match
+            │   └── submission.ack
+            └── oracle.handle                      (reference-oracle)
+                ├── oracle.match
+                └── oracle.ack
+        └── divergence.compare                     (async)
+```
+
+W3C Trace Context propagation. Custom span attributes: `ironbook.run_id`, `ironbook.platform_seq`, `ironbook.scenario_hash`, `ironbook.symbol`, `ironbook.side`, `ironbook.order_type`. Forbidden as metric labels (allowed on traces): `client_order_id`, `bot_id` (high cardinality).
+
+Overhead: ~200 B per order at 1% sampling = ~2 KB/s at 10k orders/s.
+
+Demo gold: a judge clicks any leaderboard row → Grafana Tempo → full span tree of one order with submission and oracle paths visible side-by-side.
+
+### 6.3 Metrics — histograms and labels
+
+Latency histograms:
+
+```
+ironbook_order_latency_us_bucket{
+  run_id, scenario_hash, symbol, side, order_type,
+  measurement_point  # "gateway_in_to_ack" | "submission_engine" | "oracle_engine"
+}
+```
+
+Buckets (µs, exponential): `10, 25, 50, 100, 250, 500, 1k, 2.5k, 5k, 10k, 25k, 50k, 100k, +Inf`.
+
+For score-of-record, ClickHouse `quantileTDigestState` is the source. Prometheus histograms power Grafana but don't drive scoring.
+
+Allowed dimensions (cardinality bounded): `run_id` (10² active, 10⁴ historical w/ 30 d TTL), `scenario_hash` (~10²), `symbol` (~10), `side` (2), `order_type` (2), `measurement_point` (3), `submission_sha256` (~10²). Total ~24 M combinations — Prometheus is comfortable.
+
+Other metric families:
+
+```
+ironbook_orders_total{run_id, op}
+ironbook_correctness_violations_total{run_id, kind}
+ironbook_throughput_ops_per_sec{run_id}
+ironbook_gvisor_syscall_total{run_id, syscall}
+ironbook_anti_cheat_score{run_id}
+ironbook_redpanda_consumer_lag{topic, partition, group}
+ironbook_clickhouse_insert_rows_per_sec{table}
+```
+
+### 6.4 Continuous profiling (Parca)
+
+Parca DaemonSet, eBPF-based CPU profiles at 19 Hz. No instrumentation. Per-pod flame graphs, live; diff view across regimes.
+
+Storage budget: 19 Hz × 10 active pods × 7 d × 200 B/sample = ~115 MB.
+
+Profile labels: `parca_pprof{pod, container, run_id, submission_sha256, scenario_hash}`. Frontend embeds Parca iframe per `BenchmarkRun` row.
+
+### 6.5 ClickHouse schema
+
+#### 6.5.1 `runs_raw` — every event
+
+```sql
+CREATE TABLE runs_raw
+(
+    run_id           UUID,
+    platform_seq     UInt64,
+    platform_ts      UInt64,
+    event_kind       Enum8('order'=1,'ack'=2,'fill'=3,'cancel'=4,'divergence'=5),
+    client_order_id  UInt128,
+    session_token    FixedString(32),
+    side             Enum8('bid'=1,'ask'=2),
+    qty              UInt64,
+    price            Int64,
+    order_type       Enum8('limit'=1,'market'=2),
+    tif              Enum8('gtc'=1,'ioc'=2,'fok'=3),
+    in_ts_ns         UInt64,
+    ack_ts_ns        UInt64,
+    fills            Array(Tuple(trade_id UInt64, maker_seq UInt64, price Int64, qty UInt64)),
+    divergence_kind  Enum8('match'=1,'content'=2,'sub_missing'=3,'oracle_missing'=4) DEFAULT 'match',
+    submission_sha256 FixedString(64),
+    scenario_hash    FixedString(64),
+    inserted_at      DateTime64(9) DEFAULT now64()
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMMDD(inserted_at)
+ORDER BY (run_id, platform_seq)
+SETTINGS index_granularity = 8192,
+         storage_policy = 'tiered_zstd',
+         ttl = 'inserted_at + INTERVAL 7 DAY DELETE'
+;
+```
+
+`ORDER BY (run_id, platform_seq)` matches every score query's access pattern. `tiered_zstd` storage policy: hot tier on local SSD, cold tier on MinIO via S3 disk after 24 h.
+
+#### 6.5.2 `runs_per_sec` — 1-second rollups
+
+```sql
+CREATE MATERIALIZED VIEW runs_per_sec
+ENGINE = AggregatingMergeTree
+PARTITION BY toYYYYMMDD(ts_sec)
+ORDER BY (run_id, ts_sec)
+AS SELECT
+    run_id,
+    toStartOfInterval(fromUnixTimestamp64Nano(ack_ts_ns), INTERVAL 1 SECOND) AS ts_sec,
+    count()                                                  AS orders,
+    countIf(event_kind = 'fill')                             AS fills,
+    countIf(divergence_kind != 'match')                      AS divergences,
+    quantileTDigestState(0.5)(ack_ts_ns - in_ts_ns)          AS p50_state,
+    quantileTDigestState(0.99)(ack_ts_ns - in_ts_ns)         AS p99_state,
+    sumState(toUInt64(qty))                                  AS qty_state
+FROM runs_raw
+WHERE event_kind = 'ack'
+GROUP BY run_id, ts_sec
+;
+```
+
+`quantileTDigestState` is mergeable — final p50/p99 over any window comes from merging per-second states, not re-scanning raw events.
+
+#### 6.5.3 `runs_summary` — final per-run
+
+```sql
+CREATE MATERIALIZED VIEW runs_summary
+ENGINE = AggregatingMergeTree
+ORDER BY run_id
+AS SELECT
+    run_id,
+    minState(in_ts_ns)                                       AS started_at_state,
+    maxState(ack_ts_ns)                                      AS ended_at_state,
+    countState()                                             AS total_orders_state,
+    quantileTDigestState(0.5)(ack_ts_ns - in_ts_ns)          AS p50_state,
+    quantileTDigestState(0.9)(ack_ts_ns - in_ts_ns)          AS p90_state,
+    quantileTDigestState(0.99)(ack_ts_ns - in_ts_ns)         AS p99_state,
+    quantileTDigestState(0.999)(ack_ts_ns - in_ts_ns)        AS p999_state,
+    countIfState(divergence_kind = 'content')                AS content_div_state,
+    countIfState(divergence_kind = 'sub_missing')            AS sub_miss_state,
+    countIfState(divergence_kind = 'match')                  AS match_state
+FROM runs_raw
+GROUP BY run_id
+;
+```
+
+Scoring engine queries this view exclusively.
+
+### 6.6 Composite scoring formula
+
+```
+score = correctness_gate × (1 - anti_cheat_penalty) ×
+        ( 0.40 × latency_score
+        + 0.20 × throughput_score
+        + 0.20 × tail_score
+        + 0.20 × stability_score )
+        × 1000
+```
+
+| Term | Formula | Range | Notes |
+|---|---|---|---|
+| `correctness_gate` | `1 if (matches/total) ≥ 0.999 else 0` | {0, 1} | Hard gate |
+| `anti_cheat_penalty` | sum of weighted flags from §6.8 | [0, 1] | 0.1 per flag, capped 1.0 |
+| `latency_score` | `clamp(1 - log10(p50_us / p50_target_us), 0, 1)` | [0, 1] | Targets per scenario |
+| `throughput_score` | `clamp(sustained_tps / tps_target, 0, 1)` | [0, 1] | Sustained for ≥ 60% of run |
+| `tail_score` | `clamp(1 - log10(p99_us / p99_target_us), 0, 1)` | [0, 1] | Penalises p99 outliers |
+| `stability_score` | `1 - (p99 - p50) / (p99 + p50)` | [0, 1] | CV-style |
+
+**Worked example.** p50 = 90 µs, p99 = 250 µs, sustained TPS = 45k, correctness = 100%, no flags, scenario targets `p50=50, p99=200, tps=50000`:
+
+```
+latency_score    = clamp(1 - log10(90/50),   0, 1) = 0.745
+throughput_score = clamp(45000/50000,        0, 1) = 0.900
+tail_score       = clamp(1 - log10(250/200), 0, 1) = 0.903
+stability_score  = 1 - (250-90)/(250+90)            = 0.530
+
+score = 1 × 1 × (0.40×0.745 + 0.20×0.900 + 0.20×0.903 + 0.20×0.530) × 1000 = 765
+```
+
+Log scale on latency: meaningful gap at 50 vs 100 µs; smaller gap at 5 vs 10 ms.
+
+Correctness as a *gate*, not a *weight*: a 50-µs engine that gets fills wrong is worse than useless.
+
+Targets in `scenario.yaml`:
+
+```yaml
+targets:
+  p50_us: 50
+  p99_us: 200
+  tps:    50000
+  duration_min_seconds: 300
+```
+
+Targets are not secret. Reproducible per-scenario scale.
+
+Every term in the score is derivable from `runs_summary`. A judge can click `score` → breakdown → `latency_score` underlying state → raw distribution → an outlier bucket → traces in Tempo. Five clicks from "the number" to "the order that produced it."
+
+### 6.7 Glicko-2 rating across scenarios
+
+Each submission has `(μ, φ, σ)`:
+- `μ` rating, displayed as `1500 + (μ × 173.7178)` (ELO-equivalent).
+- `φ` rating deviation, shrinks with more matches.
+- `σ` volatility, grows when results are inconsistent.
+
+After every `BenchmarkRun.COMPLETE`:
+
+```
+expected_outcome = sigmoid((submission_score - scenario_baseline) / 100)
+actual_outcome   = submission_score / 1000   # in [0, 1]
+```
+
+Update batched every 15 min (rating period).
+
+Leaderboard sort: `μ - 2φ` (conservative lower bound). Submissions with too few runs sort low until they prove themselves.
+
+Display:
+
+```
+rank │ submission       │ rating         │ runs │ last_seen
+─────┼──────────────────┼────────────────┼──────┼──────────
+  1  │ rust-engine-v3   │ 1842 ± 32     │  47  │ 2 min ago
+  2  │ go-matcher-pro   │ 1791 ± 28     │  52  │ 5 min ago
+  3  │ cpp-hft-attempt  │ 1755 ± 88     │   9  │ 12 min ago    ← high uncertainty
+```
+
+`±` is `1.96 × φ_display` (95% CI).
+
+### 6.8 Anti-cheat scoring signals
+
+| Signal | Source | Weight | Trigger |
+|---|---|---|---|
+| Excessive `clock_gettime` | eBPF | 0.1 | > 30% of total syscalls |
+| Background syscalls | eBPF | 0.2 | `syscall_count / order_count > 5×` rolling baseline |
+| Quiet-then-burst | eBPF | 0.1 | gaps > 1 s, then > 100 ops in 10 ms |
+| CPU on idle pod | cgroup | 0.2 | CPU accumulated when no orders pending in last 10 s |
+| Network egress attempt | iptables counter | 0.5 | non-zero blocked packets |
+| Memory growth past steady-state | cgroup | 0.1 | RSS > 90% limit for > 60 s after warmup |
+| Repeated divergence | divergence-detector | 0.3 | same `client_order_id` diverges in 3+ replays |
+| Determinism breach | replay engine | 0.5 | output differs across two byte-identical replays |
+
+`anti_cheat_penalty = min(1.0, Σ weights)`. Auto-rerun on a single flag; persistent flags drop the rating; transient flags don't.
+
+### 6.9 Grafana dashboards
+
+| Dashboard | For | Key panels |
+|---|---|---|
+| Live Leaderboard | Judges (default) | rank table, top-3 latency CDFs, correctness gauge, regime indicator |
+| Run Inspector | Judges (drilldown) | trace tree (Tempo embed), latency histogram, divergence list, syscall heatmap, Parca flame graph |
+| Submission History | Judges (per-submission) | rating sparkline, scenarios played, p99 over time, anti-cheat history |
+| Platform Health | Operator | Redpanda lag, CH insert rate, gateway QPS, gVisor pod count, WG link RTT |
+| Audit | Operator | mutating CR ops, exec attempts, signature verification events |
+
+Dashboards committed as JSON under `deploy/grafana/dashboards/`, provisioned by Argo CD.
+
+### 6.10 Alertmanager
+
+| Alert | Trigger | Severity |
+|---|---|---|
+| `OracleDivergenceLag` | divergence detector lag > 30 s | critical |
+| `RedpandaLag` | consumer lag > 10× p99 | warn |
+| `ClickHouseInsertFailing` | insert error rate > 1% for 1 min | critical |
+| `WireguardLinkDown` | WG handshake older than 60 s | critical |
+| `ProvenanceVerifyFailed` | image without SLSA attestation | critical |
+| `OracleMissingEvent` | any `oracle_missing` divergence | critical |
+| `ChaosAgentTriggered` | chaos action initiated | info |
+| `BenchmarkRunStuckPriming` | run in PRIMING > 30 s | warn |
+
+Slack/Discord webhook (no team to page).
+
+### 6.11 Out of scope
+
+- Distributed tracing across the WG link at the order-flow level (order flow stays intra-cluster).
+- Adaptive sampling (rule-based only).
+- SLO error-budget burn-rate dashboards (future work).
+- Cost tracking (Hetzner is flat €10/mo).
 
 ---
 
