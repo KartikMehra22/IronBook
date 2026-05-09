@@ -1750,16 +1750,228 @@ Slack/Discord webhook (no team to page).
 
 ---
 
-## 7. Testing Strategy — PENDING
+## 7. Testing Strategy — APPROVED
 
-> *Planned subsections:*
->
-> 7.1 Unit tests (per crate / per package)
-> 7.2 Property-based tests (matching engine via proptest)
-> 7.3 Integration tests (Testcontainers for Redpanda / Postgres / ClickHouse)
-> 7.4 End-to-end tests (kind cluster + sample submissions)
-> 7.5 Chaos suite (chaos-agent driven)
-> 7.6 CI gates (self-replay byte-equality, image signing, Trivy clean)
+A platform that grades correctness must be correctness-tested. Strict pyramid plus property tests, chaos tests, and the self-replay byte-equality CI gate.
+
+### 7.1 Test pyramid
+
+```
+           ┌─────────────────────────┐
+           │     E2E (kind cluster)   │   ~12 tests, 8–15 min wall  ── 1×/PR + nightly
+           ├─────────────────────────┤
+           │   Chaos suite           │   ~8 scenarios, 20 min        ── nightly only
+           ├───────────────────────────┤
+           │  Integration            │   ~80 tests, ~3 min total     ── per-PR
+           ├─────────────────────────────┤
+           │      Property-based     │   ~12 properties × 1k cases   ── per-PR
+           ├───────────────────────────────┤
+           │        Unit             │   ~600 tests, ~30 s total     ── per-commit
+           └─────────────────────────────────┘
+```
+
+PR budget: ≤ 5 min `git push` to green check. Slower → nightly.
+
+Coverage targets (judged on what's tested, not enforced as a number):
+- Matching engine: 100% line, 90% branch (property tests carry most weight).
+- Operator reconcilers: ≥ 80% line.
+- Gateway / sidecar / ingester / divergence-detector: ≥ 75%.
+- Frontend: smoke E2E only.
+
+### 7.2 Unit tests
+
+#### Rust crates
+Run via `cargo nextest run --workspace`. Conventions: every `pub fn` has a happy-path test; every `Result` has an error-path test. Naming by suffix: `test_*`, `prop_*`, `bench_*`.
+
+#### Go packages
+Run via `go test ./... -race -count=1 -timeout 60s`. `-race` is mandatory. Table-driven tests with `t.Run(...)` subtests.
+
+#### Fakes vs mocks
+Mocks lie about the system. Fakes implement it cheaply.
+- Postgres / ClickHouse / Redpanda / Redis → real, in Testcontainers.
+- K8s API → `controller-runtime/pkg/client/fake`.
+- gRPC clients → `bufconn` in-memory transport.
+- `pgxmock` only when the SQL is the unit under test.
+
+### 7.3 Property-based tests
+
+Twelve properties total (see §5.2.4):
+
+| Component | Properties |
+|---|---|
+| Matching engine | C1 (PTP), C2 (fill conservation), C6 (idempotency) |
+| Replay format | round-trip, content-address stability, schema-version compat |
+| Time-service | monotonicity, batch alignment, recovery-monotonic |
+| Scenario compiler | seed determinism, schedule monotonicity, serialization stability |
+
+256 cases per CI invocation; 4096 in nightly via `PROPTEST_CASES=4096`.
+
+### 7.4 Integration tests (Testcontainers)
+
+```go
+func TestSubmissionUpload_HappyPath(t *testing.T) {
+    ctx := context.Background()
+    pg := tcpg.MustRun(ctx, "postgres:16-alpine", ...);    defer pg.Terminate(ctx)
+    minio := tcminio.MustRun(ctx, ...);                     defer minio.Terminate(ctx)
+    rp := tcredpanda.MustRun(ctx, "redpandadata/redpanda:v24.1.1"); defer rp.Terminate(ctx)
+
+    api := newAPIServer(t, pg, minio, rp); defer api.Close()
+    sha, err := api.Upload(ctx, "fixtures/hello-world.tar.zst")
+    require.NoError(t, err)
+    require.Equal(t, "sha256:abc123...", sha)
+    obj, _ := minio.GetObject(ctx, "submissions", sha)
+    require.Equal(t, sha, obj.ETag)
+    row := pg.QueryOne(t, "SELECT status FROM submissions WHERE sha256 = $1", sha)
+    require.Equal(t, "PENDING", row.Status)
+    events := rp.Consume(ctx, "submissions.uploaded", 1, 5*time.Second)
+    require.Len(t, events, 1)
+}
+```
+
+Conventions: one container per test class via `t.Cleanup`; tests parallelizable; fixtures content-addressed.
+
+### 7.5 End-to-end tests (kind cluster)
+
+```
+tests/e2e/
+  fixtures/
+    submissions/
+      correct-rust-engine/         # template impl that should always pass
+      correct-go-engine/
+      slow-engine/                 # adds 5ms sleep per order
+      buggy-engine-wrong-fills/    # produces wrong fill prices
+      buggy-engine-no-acks/        # never acks (sub_missing storm)
+      malicious-egress/            # tries to dial out (must be blocked)
+      malicious-fork-bomb/         # tries to fork (must be killed by pids.max)
+      malicious-mem-bomb/          # mallocs 8 GB (must OOM-kill)
+      cheat-clock-spoof/           # lies about its own clock
+      cheat-replay-detector/       # tries to detect replay mode
+  scenarios/{quiet-market,burst,crash-regime}.yaml
+  cases/
+    01_upload_to_ready.go
+    02_correct_engine_scores.go
+    03_slow_engine_loses_p99.go
+    04_buggy_engine_fails_gate.go
+    05_malicious_egress_blocked.go
+    06_fork_bomb_killed.go
+    07_mem_bomb_oom.go
+    08_clock_spoof_no_effect.go
+    09_replay_undetectable.go
+    10_self_replay_byte_equal.go
+    11_chaos_pod_kill_recovers.go
+    12_two_region_telemetry.go
+```
+
+kind cluster created once per CI job; cases run sequentially. Fresh cluster only on cluster-bootstrap tests.
+
+### 7.6 Chaos suite (nightly only, 20 min)
+
+| Scenario | Action | Expected |
+|---|---|---|
+| `oracle-pod-kill-mid-run` | delete oracle pod at t=30s | restart from snapshot, score within 5% of baseline |
+| `gateway-pod-kill-mid-run` | delete gateway pod | bot retries succeed; run completes |
+| `network-loss-10pct` | tc netem 10% loss bots↔gateway | p99 spikes, correctness unaffected |
+| `cpu-throttle-50pct` | cgroup CPU limit halved on submission | throughput drops, score drops, no crashes |
+| `redpanda-broker-restart` | restart broker | telemetry catches up via consumer group |
+| `clickhouse-down-30s` | stop CH for 30s | ingester drops with counter; CH catches up |
+| `wg-link-flap` | WG down 5s | region B unhealthy; new runs paused; old continue |
+| `clock-skew-50ms` | chronyc settime +50ms on Hetzner | time-service detects, fail-fast new orders |
+
+Regressions are CI-blocking.
+
+### 7.7 Performance regression suite
+
+Targets enforced in CI:
+
+| Bench | Target | Hard fail at |
+|---|---|---|
+| `match_limit_uncrossed` | ≥ 1.5M ops/s | < 1.0M |
+| `match_limit_one_fill` | ≥ 800k ops/s | < 500k |
+| `match_limit_walk_5_levels` | ≥ 200k ops/s | < 120k |
+| `gateway.fork_p99` | ≤ 50 µs | > 100 µs |
+| `telemetry-ingester.insert_batch` (1k rows) | ≥ 50k rows/s | < 20k |
+
+`criterion` baseline diff against last green main; > 10% regression flags PR.
+
+### 7.8 Fuzzing (cargo fuzz, nightly)
+
+| Target | Why |
+|---|---|
+| `fuzz_target_match` | Random bytes → matching engine; panics, overflows, infinite loops |
+| `fuzz_target_fix_parser` | Random FIX 4.4 → gateway parser |
+| `fuzz_target_replay_parquet` | Random Parquet → replay-engine deserializer |
+
+30 min each. Crashes committed as fixtures and added to unit suite.
+
+### 7.9 Mutation testing
+
+`cargo mutants` against `crates/matching-engine` only. Target ≥ 90% mutants caught. Not a CI gate; runs weekly + on demand.
+
+### 7.10 Sample submissions as fixtures
+
+The ten fixtures double as the public **contestant template library** under `templates/`. The E2E suite tests real submissions, not synthetic doubles.
+
+### 7.11 CI pipeline DAG
+
+```mermaid
+flowchart LR
+    push["git push / PR"] --> lint["lint + fmt<br/>(rustfmt, clippy, gofmt, golangci-lint)"]
+    push --> sec["security scan<br/>(gosec, cargo-audit, Trivy fs)"]
+    lint --> unit["unit tests<br/>(nextest, go test -race)"]
+    sec --> unit
+    unit --> prop["property tests<br/>(proptest, 256 cases)"]
+    unit --> integ["integration tests<br/>(Testcontainers)"]
+    prop --> bench["bench regression<br/>(criterion baseline diff)"]
+    integ --> e2e["E2E (kind)"]
+    bench --> e2e
+    e2e --> cigates["CI gates"]
+    cigates --> sigcheck["self-replay<br/>byte-equality"]
+    cigates --> imgsign["image signing<br/>(Cosign)"]
+    cigates --> sbom["SBOM + SLSA-3"]
+    cigates --> trivy["Trivy clean<br/>(CRITICAL=0)"]
+    sigcheck --> deploy["Argo CD reconcile<br/>(staging branch only)"]
+    imgsign --> deploy
+    sbom --> deploy
+    trivy --> deploy
+    push --> nightly["nightly only:<br/>chaos, fuzz, proptest 4k cases,<br/>mutation testing"]
+```
+
+PR target: ≤ 12 min (parallelizable to ≤ 6 min). Nightly: ~90 min at 03:00 UTC.
+
+### 7.12 CI gates (must pass to merge)
+
+- Unit + integration tests green
+- Property tests green
+- `make ci-self-replay` (determinism intact)
+- No criterion bench regressed > 10%
+- All images Cosign-signed
+- SLSA-3 attestations present
+- Trivy: 0 CRITICAL CVEs in final images
+- `gosec` and `cargo-audit` clean
+- No new `unwrap()` / `expect()` in non-test Rust without `// SAFETY:` annotation
+- Generated protobuf in sync (`make proto && git diff --exit-code`)
+
+### 7.13 Local developer workflow
+
+```
+make dev                 # spin up minimal local stack: kind + PG + CH + Redpanda
+make test-unit           # ~30 s
+make test-prop           # ~1 min (matching-engine changes)
+make test-integ          # ~3 min (PR prep)
+make test-e2e            # ~15 min (rare)
+make ci-local            # mirrors PR check, ~6 min
+make bench               # ~3 min
+make fuzz                # 30 s smoke; full nightly
+make chaos local-1h      # one chaos scenario manually
+```
+
+### 7.14 Out of scope
+
+- Visual regression testing of the dashboard.
+- Synthetic load tests beyond bench suite (the bot fleet is the load test).
+- Browser-based E2E beyond one `chromedp` smoke step.
+- Cross-platform testing (Linux ARM64 + AMD64 only).
+- CodeQL / commercial static analyzers.
 
 ---
 
