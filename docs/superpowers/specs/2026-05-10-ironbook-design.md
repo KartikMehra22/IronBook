@@ -1074,16 +1074,353 @@ App-level audit events (every mutating action) carry `actor`, `action`, `target`
 
 ---
 
-## 5. Correctness & Replay Engine — PENDING
+## 5. Correctness & Replay Engine — APPROVED
 
-> *Planned subsections:*
->
-> 5.1 Correctness invariants (price-time priority, fill consistency, no phantom fills)
-> 5.2 Reference oracle as ground truth
-> 5.3 Live divergence detection
-> 5.4 Deterministic replay format (Parquet schema, content addressing)
-> 5.5 Replay-driven A/B comparison
-> 5.6 Self-replay byte-equality CI gate
+The single biggest moat in the project. A parallel reference oracle, live stream-join divergence detection, content-addressed Parquet replay logs, and a CI gate that proves the pipeline is deterministic.
+
+### 5.1 Formal correctness invariants
+
+| # | Property | Statement | Detector |
+|---|---|---|---|
+| **C1** | Price-time priority | For any fill at price P from side `Bid`, no resting `Ask` at price ≤ P with earlier `platform_seq` was unfilled before it. (Symmetric for sells.) | Stream-join: oracle authoritative; submission disagreement = violation |
+| **C2** | Fill conservation | For every accepted order, `Σ filled_qty ≤ original_qty`. For every fill, both referenced orders existed and had ≥ `qty` remaining at the time. | Per-order qty accounting in oracle |
+| **C3** | No phantom fills | Every fill must reference orders the platform sent. | Oracle's input set is the universe |
+| **C4** | Atomicity per order | An order ends in exactly one of: fully filled, partially filled + resting, fully resting, fully cancelled, rejected. | Lifecycle state machine asserted on every event |
+| **C5** | Determinism | Same `(scenario_hash, oracle_image_sha256)` → same output stream. | Self-replay byte-equality CI gate (§5.6) |
+| **C6** | Idempotency | Re-applying the same `(platform_seq, order)` produces identical state. | Property test in `crates/matching-engine` |
+
+We require the *oracle* to be deterministic, not the submission. A submission can use random tie-breaking, parallel matching, anything — but it is scored on input replayed bit-identically against the oracle's deterministic decisions.
+
+```mermaid
+flowchart LR
+    inp["scenario YAML"] --> sched["compiled schedule<br/>(seeded PRNG)"]
+    sched -- "deterministic" --> orcl["reference-oracle output<br/>(ground truth)"]
+    sched -- "may differ each run" --> sub["submission output"]
+    orcl --> div{"per-order<br/>divergence?"}
+    sub --> div
+    div -- "match" --> ok["correctness++"]
+    div -- "diverge" --> bad["correctness violation<br/>logged with category"]
+```
+
+### 5.2 The reference oracle
+
+A Rust matching engine in `crates/matching-engine`, wrapped at the wire by the `reference-oracle` service.
+
+#### 5.2.1 Internal data model
+
+```rust
+// crates/matching-engine/src/types.rs (sketch)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Price(pub i64);   // ticks; integer math, never floats
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Qty(pub u64);     // unsigned; subtraction is checked
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side { Bid, Ask }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrderType { Limit { price: Price, tif: TimeInForce }, Market }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeInForce { GTC, IOC, FOK }
+
+#[derive(Clone, Debug)]
+pub struct Order {
+    pub platform_seq: u64,
+    pub platform_ts: u64,
+    pub client_order_id: u128,    // (bot_id, local_seq) packed
+    pub session_token: SessionToken,
+    pub side: Side,
+    pub qty: Qty,
+    pub kind: OrderType,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fill {
+    pub trade_id: u64,
+    pub platform_seq_taker: u64,
+    pub platform_seq_maker: u64,
+    pub price: Price,
+    pub qty: Qty,
+    pub ts: u64,
+}
+```
+
+Integer-only prices and quantities — no floats, ever. `u128 client_order_id` packs `(bot_id, local_seq)` so independent bot sequences never collide. `platform_seq` is the global ordering; `platform_ts` is informational.
+
+#### 5.2.2 Order book
+
+```rust
+pub struct OrderBook {
+    bids: BTreeMap<Price, VecDeque<Resting>>,  // descending iteration (best bid)
+    asks: BTreeMap<Price, VecDeque<Resting>>,  // ascending  iteration (best ask)
+    by_id: HashMap<u128, OrderRef>,
+    next_trade_id: u64,
+}
+```
+
+`BTreeMap` gives O(log N) best-price + ordered iteration — exactly the matching loop's access pattern. Per-level `VecDeque` is the price-time priority queue (push back, pop front, both O(1), contiguous in cache). Same shape as Nasdaq ITCH order books.
+
+#### 5.2.3 Match algorithm (limit order, simplified)
+
+```rust
+pub fn match_limit(&mut self, taker: Order) -> Vec<Fill> {
+    let mut fills = Vec::new();
+    let mut remaining = taker.qty;
+    let opposite = match taker.side { Side::Bid => &mut self.asks, Side::Ask => &mut self.bids };
+    while let Some((&best_price, queue)) = next_best(opposite, taker.side) {
+        if !crosses(taker.kind, taker.side, best_price) { break; }
+        while let Some(resting) = queue.front_mut() {
+            if remaining.0 == 0 { break; }
+            let traded = remaining.min(resting.qty_remaining);
+            fills.push(Fill { trade_id: self.next_trade_id, platform_seq_taker: taker.platform_seq,
+                              platform_seq_maker: resting.platform_seq, price: best_price,
+                              qty: traded, ts: taker.platform_ts });
+            self.next_trade_id += 1;
+            remaining = remaining.checked_sub(traded).unwrap();
+            resting.qty_remaining = resting.qty_remaining.checked_sub(traded).unwrap();
+            if resting.qty_remaining.0 == 0 { queue.pop_front(); }
+        }
+        if queue.is_empty() { opposite.remove(&best_price); }
+        if remaining.0 == 0 { break; }
+    }
+    if remaining.0 > 0 {
+        match taker.kind {
+            OrderType::Limit { tif: TimeInForce::IOC, .. } => { /* discard */ }
+            OrderType::Limit { tif: TimeInForce::FOK, .. } if !fills.is_empty() => {
+                self.rollback(&fills); fills.clear();
+            }
+            OrderType::Limit { price, tif: TimeInForce::GTC } => self.rest(taker.with_qty(remaining), price),
+            OrderType::Market => { /* discard remaining */ }
+            _ => {}
+        }
+    }
+    fills
+}
+```
+
+#### 5.2.4 Property tests
+
+`tests/proptest.rs` generates random sequences and asserts C1–C6:
+
+```rust
+proptest! {
+    #[test]
+    fn fill_conservation(orders in arb_order_sequence(1..1000)) {
+        let mut book = OrderBook::new();
+        let (mut buy_filled, mut sell_filled) = (0u64, 0u64);
+        for o in &orders {
+            for f in book.apply(o.clone()) {
+                match o.side { Side::Bid => buy_filled += f.qty.0, Side::Ask => sell_filled += f.qty.0 }
+                prop_assert!(f.qty.0 > 0); prop_assert!(f.price.0 > 0);
+            }
+        }
+        prop_assert_eq!(buy_filled, sell_filled);
+    }
+
+    #[test]
+    fn price_time_priority(orders in arb_order_sequence(1..500)) {
+        let mut book = OrderBook::new();
+        for o in &orders {
+            for f in &book.apply(o.clone()) {
+                prop_assert!(book.has_no_better_unfilled(f));
+            }
+        }
+    }
+
+    #[test]
+    fn idempotent_reapply(orders in arb_order_sequence(1..200)) {
+        let (mut a, mut b) = (OrderBook::new(), OrderBook::new());
+        for o in &orders { a.apply(o.clone()); b.apply(o.clone()); b.apply(o.clone()); }
+        prop_assert_eq!(a.snapshot(), b.snapshot());
+    }
+}
+```
+
+#### 5.2.5 Snapshot + recovery
+
+The oracle pod can crash mid-run. On restart it reads the most recent snapshot from `/tmp/oracle-snap.zst` (taken every 100k events) and replays the Parquet input log from that point. Snapshots are deterministic — post-recovery output is byte-identical to the no-crash output. Asserted in chaos tests.
+
+### 5.3 Live divergence detection
+
+```mermaid
+stateDiagram-v2
+    [*] --> WAITING: observe (run_id, client_order_id, platform_seq)
+    WAITING --> ORACLE_ONLY: oracle event arrives
+    WAITING --> SUB_ONLY: submission event arrives
+    ORACLE_ONLY --> MATCH: submission event arrives, content equal
+    ORACLE_ONLY --> CONTENT_DIVERGENCE: submission event arrives, content differs
+    ORACLE_ONLY --> SUB_MISSING: window expires
+    SUB_ONLY --> MATCH: oracle event arrives, content equal
+    SUB_ONLY --> CONTENT_DIVERGENCE: oracle event arrives, content differs
+    SUB_ONLY --> ORACLE_MISSING: window expires (impossible — bug if seen)
+    MATCH --> [*]
+    CONTENT_DIVERGENCE --> [*]
+    SUB_MISSING --> [*]
+    ORACLE_MISSING --> [*]
+```
+
+```rust
+struct State {
+    pending: LruCache<Key, Pending>,
+    metrics: Counters,
+}
+enum Pending { OracleOnly(OracleEvent, Instant), SubOnly(SubEvent, Instant) }
+type Key = (RunId, OrderId, PlatformSeq);
+
+fn on_oracle(state: &mut State, ev: OracleEvent) {
+    let key = ev.key();
+    match state.pending.pop(&key) {
+        Some(Pending::SubOnly(sub, _)) => emit_compare(state, ev, sub),
+        Some(Pending::OracleOnly(_, _)) => unreachable!("oracle dup"),
+        None => state.pending.put(key, Pending::OracleOnly(ev, Instant::now())),
+    }
+    state.gc_expired();
+}
+```
+
+**Sizing**: window = 10 s of throughput; LRU capacity = `peak_orders_per_sec × 10 × 1.5` (50% headroom). At 50k orders/s sustained, ~750k entries × 256 B = ~192 MB resident.
+
+**Divergence categories and score impact:**
+
+| Category | Meaning | Score impact |
+|---|---|---|
+| `MATCH` | Submission and oracle agreed | +1 to correctness count |
+| `CONTENT_DIVERGENCE` | Different fills (count, price, qty, counterparty) | -1, weighted heavily; correctness gate |
+| `SUB_MISSING` | Submission did not produce an event for an order the gateway sent | -1, availability fail |
+| `ORACLE_MISSING` | Oracle did not produce an event but submission did | Platform bug, not submission; run flagged invalid |
+
+The composite scoring formula in §6 uses `(matches / total)` as `correctness ∈ [0, 1]` as a **gate**: any submission below 0.99 correctness is ineligible to win regardless of latency.
+
+Watermarking: Redpanda partitions for `submission_out` and `oracle_out` keyed by `run_id`. Within a single `(run_id, partition)`, ordering is preserved. Detector advances a watermark per partition based on the slowest of the two streams; "missing" events are emitted only past the watermark.
+
+### 5.4 Deterministic replay format
+
+#### 5.4.1 Parquet schema
+
+| Column | Type | Notes |
+|---|---|---|
+| `platform_seq` | INT64 | Primary ordering |
+| `platform_ts` | INT64 | Monotonic ns |
+| `run_id` | BINARY (FIXED, 16) | UUID v7 |
+| `client_order_id` | BINARY (FIXED, 16) | u128 packed |
+| `session_token` | BINARY (FIXED, 32) | Identity-stripped opaque |
+| `op` | INT32 | 0=NEW, 1=CANCEL, 2=AMEND |
+| `side` | INT32 | 0=Bid, 1=Ask |
+| `qty` | INT64 | Unsigned semantics |
+| `price` | INT64 | Tick count |
+| `order_type` | INT32 | 0=Limit, 1=Market |
+| `tif` | INT32 | 0=GTC, 1=IOC, 2=FOK |
+| `wire_format` | INT32 | 0=REST, 1=WS, 2=FIX |
+| `oracle_fills` | LIST<STRUCT> | For fast offline divergence comparison |
+| `oracle_acks` | LIST<STRUCT> | Status, code, message |
+
+Row groups 100k rows; zstd level 6; statistics enabled on `platform_seq`, `run_id`, `op` for partition pruning.
+
+#### 5.4.2 Content addressing
+
+```
+file_id = sha256( schema_version_bytes ‖ canonical_record_serialization )
+```
+
+File path: `s3://ironbook-replay/<run_id>/<file_id>.parquet`. Manifest: `(run_id, scenario_hash, submission_sha256, oracle_image_sha256, file_id, started_at, duration, total_events)`.
+
+#### 5.4.3 Sealing
+
+Replay log is append-only during run, sealed at COMPLETE. Sealing: write final Parquet footer, compute `file_id`, write `manifest.json`, set MinIO `Object-Lock` retention to "compliance mode" 7 days. Tampering is auditable.
+
+### 5.5 Replay-driven A/B comparison and tournaments
+
+#### 5.5.1 Single A/B replay
+
+```mermaid
+sequenceDiagram
+    actor Judge
+    participant Op as benchmark-operator
+    participant Rep as replay-engine
+    participant MN as MinIO
+    participant GW as fairness-gateway
+    participant SubA as submission-A pod
+    participant SubB as submission-B pod
+    participant Or as reference-oracle
+
+    Judge->>Op: replay run R against {A, B}
+    Op->>Rep: prepare two BenchmarkRuns sharing replay_source = R.file_id
+    par run A
+        Rep->>MN: GET R.parquet
+        Rep->>GW: re-emit (preserve platform_seq, ts)
+        GW->>SubA: stamped order
+        GW->>Or: stamped order
+        SubA-->>GW: ack + fills
+        Or-->>GW: ack + fills
+    and run B
+        Rep->>MN: GET R.parquet
+        Rep->>GW: re-emit (preserve platform_seq, ts)
+        GW->>SubB: stamped order
+        GW->>Or: stamped order
+        SubB-->>GW: ack + fills
+        Or-->>GW: ack + fills
+    end
+    Note over Rep: A and B faced byte-identical input;<br/>scoring is directly comparable
+```
+
+#### 5.5.2 Tournament mode (Glicko-2)
+
+Submissions get a **rating with uncertainty**, updated after every scenario:
+- `μ` (rating, ELO-equivalent)
+- `φ` (rating deviation, shrinks with more matches)
+- `σ` (volatility, grows when results are inconsistent)
+
+Leaderboard sorts by `μ - 2φ` (conservative lower bound) — submissions with too few runs sort low until they prove themselves.
+
+#### 5.5.3 Statistical significance
+
+Three replay runs per (submission, scenario) cell; report median and IQR. For "is A faster than B at p99 on scenario S?" — Mann-Whitney U test, α = 0.05. Non-significant → leaderboard shows tied.
+
+### 5.6 Self-replay byte-equality CI gate
+
+```mermaid
+flowchart LR
+    fixt["fixed scenario fixture<br/>scenario_hash = X"] --> run1["live run #1<br/>oracle vs oracle"]
+    run1 --> snap1["replay log #1<br/>file_id = F1"]
+    snap1 --> run2["replay run #2<br/>same oracle image @sha256"]
+    run2 --> snap2["replay log #2<br/>file_id = F2"]
+    snap2 --> assert{"F1 == F2?"}
+    assert -- yes --> green["CI green"]
+    assert -- no --> red["CI red:<br/>determinism broken"]
+```
+
+CI step `make ci-self-replay` runs scenario X twice (live then replay), captures both logs, asserts `F1 == F2`. If unequal, something between time-service, gateway, and oracle introduced non-determinism. CI red, ship blocked.
+
+### 5.7 Edge cases and known limits
+
+| Op | Behaviour | Divergence semantics |
+|---|---|---|
+| `NEW` | Match against book or rest | Compare fills + ack |
+| `CANCEL` | Remove resting order | Compare ack and any pending fills against cancel-race |
+| `AMEND` | Modelled as `CANCEL + NEW` | Compare both legs |
+| `IOC` | Match what's available, discard remainder | Compare fills only |
+| `FOK` | All-or-nothing | If fills ≠ qty → reject + cancel ack; compare ack |
+
+**Cancel-race**: bot sends `NEW(qty=10)` then `CANCEL`. Two valid outcomes (zero fills or partial); oracle's deterministic ordering picks one and submission must agree.
+
+**Identical timestamps**: two orders with the same `platform_ts` are still totally ordered by `platform_seq`.
+
+**Float drift in scoring**: Glicko-2 uses `f64`; x86 vs ARM math drifts in 14th decimal. Round to 6 decimals before comparison; store exact `(μ, φ, σ)` alongside displayed integer rating.
+
+**Oracle bugs**: property tests + hand-written fixtures from real exchanges. Future work: consensus oracle (two implementations, require agreement).
+
+**Replay across submission versions**: replay run R against `submission Y'` (different version). Same input, new score. Canonical use case for grading.
+
+### 5.8 Out of scope
+
+- Cross-symbol matching. Single-symbol books only; multi-symbol = future work.
+- Auction sessions (NYSE-style opening / closing). Future work.
+- Pro-rata or size-priority matching. Pure price-time only.
+- Self-trade prevention. Optional; off by default.
+- Hidden / iceberg orders. Not modelled.
+- Market data dissemination protocol. Submissions get fills/acks back, not L2/L3 feed. Future work.
 
 ---
 
