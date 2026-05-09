@@ -680,17 +680,397 @@ mTLS is automated end-to-end via **cert-manager** with a self-hosted CA. No huma
 
 ---
 
-## 4. Security & Sandbox Model — PENDING
+## 4. Security & Sandbox Model — APPROVED
 
-> *To be filled after user approval. Planned subsections:*
->
-> 4.1 Threat model (untrusted contestant code, hostile bots, hostile clients, supply-chain)
-> 4.2 Defense-in-depth layers (gVisor + seccomp + AppArmor + cgroups + NetworkPolicy + OPA + admission-webhook)
-> 4.3 Supply-chain security (Cosign signing, SLSA-3 attestations, Trivy scans, distroless base images)
-> 4.4 Secrets management (cert-manager, k8s Secrets encrypted at rest, sealed-secrets in git)
-> 4.5 IAM / RBAC (per-CRD RBAC, ServiceAccount per service, no cluster-admin in runtime path)
-> 4.6 Anti-cheat (egress denial, identity stripping at gateway, syscall budget via eBPF, image-pinning)
-> 4.7 Audit logging (compliance-grade event log, immutable in ClickHouse + MinIO archival)
+The hardest section to write well, the easiest to fake. Below: real threat model, defense-in-depth with actual config, supply-chain pipeline, secrets, RBAC, anti-cheat, audit. Each control names what it stops.
+
+### 4.1 Threat model
+
+Six adversaries, ranked by likelihood × impact for *this* platform.
+
+| # | Adversary | Likelihood | Impact | Primary scenarios |
+|---|---|---|---|---|
+| **T1** | Hostile contestant binary | High | Catastrophic | Container escape, kernel exploit, network scan, SSRF to platform metadata, fork bomb, OOM kill the host, crypto mining, exfiltrate other submissions' source from MinIO |
+| **T2** | Hostile contestant runtime behaviour | High | Severe | Detect/identify specific bots and game them; clock-based side channels; deliberately flag-mine the divergence detector to invalidate competitors |
+| **T3** | Hostile upload (build-time) | Medium | Severe | Malicious dependency, build-time exfil, supply-chain pivot through `cargo build.rs` / `go generate` / CMake hooks |
+| **T4** | Compromised platform image | Low | Catastrophic | Poisoned operator / gateway / sidecar image at build or pull time |
+| **T5** | External attacker (public surface) | Medium | Moderate | Dashboard DDoS, API abuse, JWT theft, leaderboard manipulation |
+| **T6** | Replay manipulation | Low | Moderate | Submission detects "I'm in replay mode" and switches strategy to game the comparison run |
+
+T6 is unusual but real for HFT — explaining how we defeat it is a credibility signal.
+
+### 4.2 Defense-in-depth — submission pod isolation (the T1 + T2 wall)
+
+Seven concentric layers. A bypass of any one must still hit the next.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                            HOST KERNEL (Linux)                           │
+│                                                                          │
+│  ┌──────────────────────────────────────────────────────────────────┐    │
+│  │                         LAYER 7: NetworkPolicy                    │    │
+│  │   ┌────────────────────────────────────────────────────────────┐ │    │
+│  │   │           LAYER 6: iptables host backstop                   │ │    │
+│  │   │   ┌──────────────────────────────────────────────────────┐ │ │    │
+│  │   │   │           LAYER 5: cgroups v2                         │ │ │    │
+│  │   │   │   ┌────────────────────────────────────────────────┐ │ │ │    │
+│  │   │   │   │         LAYER 4: AppArmor MAC                  │ │ │ │    │
+│  │   │   │   │   ┌──────────────────────────────────────────┐ │ │ │ │    │
+│  │   │   │   │   │       LAYER 3: seccomp-bpf               │ │ │ │ │    │
+│  │   │   │   │   │   ┌────────────────────────────────────┐ │ │ │ │ │    │
+│  │   │   │   │   │   │   LAYER 2: gVisor user-space kernel │ │ │ │ │ │    │
+│  │   │   │   │   │   │   ┌──────────────────────────────┐ │ │ │ │ │ │    │
+│  │   │   │   │   │   │   │ LAYER 1: pod securityContext │ │ │ │ │ │ │    │
+│  │   │   │   │   │   │   │  • runAsNonRoot              │ │ │ │ │ │ │    │
+│  │   │   │   │   │   │   │  • drop ALL capabilities     │ │ │ │ │ │ │    │
+│  │   │   │   │   │   │   │  • read-only rootfs          │ │ │ │ │ │ │    │
+│  │   │   │   │   │   │   │  • no privilege escalation   │ │ │ │ │ │ │    │
+│  │   │   │   │   │   │   │  • distroless image          │ │ │ │ │ │ │    │
+│  │   │   │   │   │   │   └──────────────────────────────┘ │ │ │ │ │ │    │
+│  │   │   │   │   │   └────────────────────────────────────┘ │ │ │ │ │    │
+│  │   │   │   │   └──────────────────────────────────────────┘ │ │ │ │    │
+│  │   │   │   └────────────────────────────────────────────────┘ │ │ │    │
+│  │   │   └──────────────────────────────────────────────────────┘ │ │    │
+│  │   └────────────────────────────────────────────────────────────┘ │    │
+│  └──────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 4.2.1 Pod manifest enforced by the admission-webhook
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: submission-{run_id}
+  namespace: submissions
+  annotations:
+    container.apparmor.security.beta.kubernetes.io/engine: localhost/ironbook-sandbox
+spec:
+  runtimeClassName: gvisor                     # forces runsc — Layer 2
+  automountServiceAccountToken: false           # no implicit k8s API
+  serviceAccountName: submission-no-perms       # zero-RBAC SA
+  hostNetwork: false
+  hostPID: false
+  hostIPC: false
+  hostUsers: false                              # user namespace remap
+  securityContext:                              # Layer 1 (pod-level)
+    runAsNonRoot: true
+    runAsUser: 65534
+    runAsGroup: 65534
+    fsGroup: 65534
+    seccompProfile:                             # Layer 3
+      type: Localhost
+      localhostProfile: profiles/ironbook-sandbox.json
+    sysctls: []                                 # no host sysctls
+  containers:
+    - name: engine
+      image: registry.local/sub/{sha256}@sha256:{digest}
+      imagePullPolicy: Always
+      securityContext:                          # Layer 1 (container)
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:                                # Layer 5 (cgroups v2)
+        limits: { cpu: "2", memory: "1Gi", ephemeral-storage: "256Mi" }
+        requests: { cpu: "2", memory: "1Gi" }
+      volumeMounts:
+        - { name: tmp, mountPath: /tmp, readOnly: false }
+        - { name: socket, mountPath: /var/run/sidecar, readOnly: false }
+  volumes:
+    - { name: tmp, emptyDir: { medium: Memory, sizeLimit: 64Mi } }
+    - { name: socket, emptyDir: {} }
+```
+
+Every line above is enforced by the admission-webhook. Missing `runtimeClassName: gvisor` → reject. Missing `runAsNonRoot` → reject. `image: foo:latest` → reject (must be `@sha256:` digest). Has `hostPath` volume → reject. Capability list non-empty after drop → reject.
+
+#### 4.2.2 seccomp profile (excerpt)
+
+Start from Docker default and *subtract*:
+
+```json
+{
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "defaultErrnoRet": 1,
+  "syscalls": [
+    {
+      "action": "SCMP_ACT_ALLOW",
+      "names": [
+        "read","write","close","fstat","mmap","mprotect","munmap","brk",
+        "rt_sigaction","rt_sigprocmask","rt_sigreturn","ioctl","pread64",
+        "pwrite64","readv","writev","access","pipe","select","sched_yield",
+        "mremap","msync","mincore","madvise","clone","execve","exit",
+        "wait4","kill","uname","fcntl","getdents64","getcwd","openat",
+        "readlinkat","getpid","sendfile","socket","connect","accept","sendto",
+        "recvfrom","sendmsg","recvmsg","shutdown","bind","listen","getsockname",
+        "getpeername","setsockopt","getsockopt","clone3","futex","epoll_create1",
+        "epoll_ctl","epoll_wait","eventfd2","timerfd_create","timerfd_settime",
+        "nanosleep","clock_gettime","clock_nanosleep","getrandom","prlimit64",
+        "set_tid_address","arch_prctl","set_robust_list","exit_group","tgkill"
+      ]
+    }
+  ]
+}
+```
+
+Explicitly denied: `ptrace`, `process_vm_readv/writev`, `kexec_load`, `init_module`, `delete_module`, `bpf`, `keyctl`, `add_key`, `request_key`, `mount`, `umount2`, `pivot_root`, `chroot`, `swapon`, `swapoff`, `reboot`, `setns`, `unshare`, `userfaultfd`, `io_uring_setup` (uring is too new + risky surface), and `clone` flags `CLONE_NEWUSER` / `CLONE_NEWNS`. `io_uring` denial costs ~20% throughput on theoretical max but is defensible: it's been a vector in 2022–2024 escapes.
+
+#### 4.2.3 AppArmor profile (excerpt)
+
+```
+profile ironbook-sandbox flags=(attach_disconnected, mediate_deleted) {
+  #include <abstractions/base>
+  capability,
+  deny capability sys_admin,
+  deny capability sys_module,
+  deny capability sys_ptrace,
+  deny capability net_admin,
+  deny capability net_raw,
+
+  /tmp/** rw,
+  /var/run/sidecar/sock rw,
+  /proc/self/** r,
+  deny /proc/sys/** rwklx,
+  deny /sys/** rwklx,
+  deny /etc/shadow* rwklx,
+  deny /root/** rwklx,
+
+  network inet stream,
+  network inet6 stream,
+  deny network packet,
+  deny network raw,
+}
+```
+
+#### 4.2.4 NetworkPolicy (Layer 7) — the egress wall
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: submission-egress-deny-all
+  namespace: submissions
+spec:
+  podSelector: { matchLabels: { app: submission } }
+  policyTypes: [Egress, Ingress]
+  egress: []                                  # deny ALL egress at L7
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: fairness-gateway } }
+      ports:
+        - { port: 8080, protocol: TCP }       # HTTP/2
+        - { port: 8081, protocol: TCP }       # WS
+        - { port: 9876, protocol: TCP }       # FIX
+```
+
+Order replies leave via the same TCP connection the gateway opened. Telemetry sidecar uses a **unix domain socket** in a shared `emptyDir` — there is no allowed egress for the submission container at L7.
+
+#### 4.2.5 iptables host backstop (Layer 6)
+
+```bash
+nft add table inet ironbook
+nft add chain inet ironbook submission_egress { type filter hook output priority -50 \; policy accept \; }
+nft add rule inet ironbook submission_egress meta cgroup != 0 \
+  meta cgroup id @submissions_cgrp_id \
+  ip daddr != 10.42.0.0/16 drop
+```
+
+#### 4.2.6 cgroups v2 (Layer 5)
+
+```
+/sys/fs/cgroup/kubepods.slice/.../submission-{run_id}/
+  cpu.max               = "200000 100000"      # 2 vCPU pinned
+  memory.max            = "1073741824"          # 1 GB hard limit
+  pids.max              = "100"                 # fork-bomb cap
+  io.weight             = "100"                 # starve I/O
+  cpuset.cpus           = "2-3"                 # NUMA pin (Hetzner CCX13 = 4 vCPU)
+  cpuset.cpus.partition = "root"                # dedicated, not shared
+```
+
+The bot-fleet runs on cores 0–1; submissions get 2–3. Pinning isolates measurement from noise.
+
+### 4.3 Defense-in-depth — the build pipeline (T3 wall)
+
+```mermaid
+flowchart LR
+    upload["source.tar.zst<br/>content-addressed"] --> verify["verify uploader sig<br/>(optional cosign)"]
+    verify --> hermetic["hermetic build env<br/>egress-denied namespace<br/>ephemeral pod<br/>dependency mirror only<br/>no host mounts<br/>10 min timeout"]
+    hermetic --> sbom["syft SBOM"]
+    hermetic --> trivy["Trivy scan<br/>CVE / license / secret"]
+    sbom --> attest["SLSA-3 provenance<br/>in-toto attestation"]
+    trivy --> attest
+    attest --> sign["Cosign sign<br/>platform key, OIDC"]
+    sign --> push["push to in-cluster<br/>registry"]
+    push --> reject_path{"any check<br/>failed?"}
+    reject_path -- yes --> reject["status=REJECTED<br/>+ audit event"]
+    reject_path -- no --> ready["status=READY"]
+```
+
+- Build pod in namespace `builds/` with NetworkPolicy denying all egress except an in-cluster Cargo / Go module / pip mirror.
+- Mirror is read-only and pre-populated; new dependencies require a separate request process.
+- Build pod has its own seccomp profile (looser than runtime — needs `mount` for `tmpfs`).
+- Build outputs to `emptyDir`; runner copies binary to MinIO via unix-socket-only sidecar.
+- 10 min wall-clock timeout, 4 GB memory cap. Fork bombs in `build.rs` die.
+- Final image is **distroless** — no shell, no package manager, no `curl`, no `nc`.
+- Image cosign-signed with the platform key (Sigstore Fulcio + Rekor).
+- **SLSA-3 provenance** stored as `in-toto` attestation alongside image; admission-webhook verifies it.
+
+### 4.4 Supply chain — platform components (T4 wall)
+
+| Image source | Signing key | Verification |
+|---|---|---|
+| Submissions | `platform-submission-signer` (Sigstore Fulcio, ephemeral) | Admission-webhook on pod create |
+| Platform components (operator, gateway, etc.) | `platform-component-signer` (long-lived, sealed-secret) | OPA Gatekeeper + ImagePolicyWebhook |
+| Base images (distroless, alpine) | upstream Sigstore | Trivy asserts upstream signature |
+
+Cosign verification policy (Gatekeeper Rego):
+
+```rego
+package ironbook.imagepolicy
+
+violation[{"msg": msg}] {
+  input.review.kind.kind == "Pod"
+  container := input.review.object.spec.containers[_]
+  not has_cosign_sig(container.image)
+  msg := sprintf("image %v missing cosign signature", [container.image])
+}
+
+violation[{"msg": msg}] {
+  input.review.kind.kind == "Pod"
+  container := input.review.object.spec.containers[_]
+  not contains(container.image, "@sha256:")
+  msg := sprintf("image %v must be pinned by digest, not tag", [container.image])
+}
+```
+
+### 4.5 Secrets management
+
+| Class | Storage | Distribution | Rotation |
+|---|---|---|---|
+| Per-run mTLS certs | cert-manager → k8s Secret | Projected volume | Per-run (ephemeral) |
+| Long-lived service mTLS | cert-manager → k8s Secret | Projected volume | 24 h, automatic |
+| Cluster CA root | Sealed Secret in git | k8s Secret in `cert-manager` ns | Annual (manual) |
+| Postgres / Redpanda / ClickHouse passwords | Sealed Secret in git | Projected volume | On compromise |
+| Cloudflare token | Sealed Secret in git | Cloudflare-tunnel daemon | On compromise |
+| Cosign signing key | Sealed Secret, decrypted on signer pod boot | In-memory only | Per release |
+| User JWT secret | Sealed Secret | submission-api / leaderboard-api | Hourly (signed JWTs ≤ 1 h) |
+
+k3s started with `--secrets-encryption` (AES-CBC at rest in etcd). Sealed-secrets-controller decrypts at apply time. **No secret is ever in a container ENV var** — all projected as files in tmpfs volumes.
+
+### 4.6 IAM / RBAC
+
+ServiceAccount-per-service, RBAC scoped narrowly.
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: benchmark-operator }
+rules:
+  - apiGroups: ["ironbook.io"]
+    resources: ["submissions","scenarios","benchmarkruns","botswarms",
+                "submissions/status","benchmarkruns/status"]
+    verbs: ["get","list","watch","create","update","patch","delete"]
+  - apiGroups: [""]
+    resources: ["pods","services","secrets","configmaps","events"]
+    verbs: ["get","list","watch","create","update","patch","delete"]
+  - apiGroups: ["cert-manager.io"]
+    resources: ["certificates"]
+    verbs: ["create","get","list","watch","delete"]
+  # NOTE: no "*" verb, no cluster-admin, no node access, no exec
+```
+
+`exec` and `port-forward` into submission pods are denied for everyone, including the operator:
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata: { name: deny-exec-into-submissions }
+webhooks:
+  - name: deny-exec.ironbook.io
+    rules:
+      - operations: ["CONNECT"]
+        apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods/exec","pods/attach","pods/portforward"]
+    namespaceSelector:
+      matchLabels: { ironbook.io/sandbox: "true" }
+    failurePolicy: Fail
+```
+
+A live demo of `kubectl exec submission-xxx -- sh` returning `Forbidden` is itself credible evidence.
+
+### 4.7 Anti-cheat
+
+A submission can lose by being slow. It cannot win by being clever in the wrong way.
+
+| Cheat | Defence |
+|---|---|
+| Lying about own clock to fake low latency | Latency measured at the gateway, not the submission. Submission's `clock_gettime` is irrelevant to scoring. |
+| Looking up `/proc` to detect "I'm in replay" | gVisor's user-space `/proc` leaks nothing about wall clock or PIDs of bot pods. AppArmor denies `/proc/sys/**`. |
+| Recognising specific bots and gaming them | Identity stripped at gateway: `bot_id` removed, replaced by per-run opaque `session_token = sha256(bot_id ‖ run_secret)`. |
+| Self-trade detection cheats | Oracle is ground truth; if submission's fills disagree with oracle's fills for the same input, it loses correctness regardless of clever reasoning. |
+| Scenario detection | Scenario is replayed bit-identically across submissions. Strategy switching is fine — same input, evaluated equally. Cleverness rewarded, not penalised. |
+| CPU mining or stealing background work | cgroup CPU pin to 2 cores; eBPF observer counts `sched_switch` events. Background work shows as elevated syscall count for no order traffic. |
+| Resource hogging | cgroup memory.max + pids.max are hard limits. OOM kill = `BenchmarkRun → ABORTED`. |
+| Replay-mode detection | No observable difference: same wire format, same opaque tokens, same `(platform_seq, platform_ts)` cadence. |
+
+eBPF anti-cheat signal:
+
+```rust
+// crates/ebpf-observer/src/syscalls.bpf.rs (simplified)
+SEC("tracepoint/syscalls/sys_enter")
+fn on_sys_enter(ctx: SyscallEnterCtx) -> u32 {
+    let cgrp_id = bpf_get_current_cgroup_id();
+    if !is_submission_cgroup(cgrp_id) { return 0; }
+    syscall_counter.increment(cgrp_id, ctx.syscall_nr, 1);
+    0
+}
+```
+
+The anti-cheat scorer flags runs where `syscall_count / order_count > 5x normal`, `clock_gettime fraction > 30%`, or long quiet periods followed by bursts. Flagged runs are re-run automatically; persistent flags drop the submission's Glicko rating.
+
+### 4.8 Audit logging
+
+Compliance-grade audit, stored two places:
+
+```mermaid
+flowchart LR
+    api[kube-apiserver] -->|audit policy| audit_file[/var/log/audit.log]
+    audit_file --> fluent[fluent-bit]
+    fluent --> ch[(ClickHouse audit_events)]
+    fluent --> mn[(MinIO archival<br/>signed daily snapshot)]
+    ch --> graf[Grafana audit dashboard]
+    submit[submission-api,<br/>operator,<br/>scoring-engine] -->|OTel span events| otel[OTel Collector]
+    otel --> ch
+```
+
+kube-apiserver audit policy:
+
+```yaml
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages: ["RequestReceived"]
+rules:
+  - level: RequestResponse
+    resources:
+      - group: "ironbook.io"   # all our CRDs at full fidelity
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["secrets","configmaps","pods/exec","pods/portforward"]
+  - level: Metadata
+```
+
+App-level audit events (every mutating action) carry `actor`, `action`, `target`, `before`, `after`, `correlation_id`. Stored in ClickHouse `audit_events` (no TTL). Daily archival to MinIO: previous day's audit rows exported as Parquet, zstd-compressed, Cosign-signed, content-addressed. Tampering with one row invalidates the daily signature.
+
+### 4.9 Out of scope (deliberately)
+
+- **Hardware Security Modules (HSM).** Out of budget; sealed-secrets is honest at hackathon scale.
+- **Public Sigstore Rekor transparency log.** We use Sigstore tooling with a private CA. Public Rekor documented as future work.
+- **Trivy in adversarial-fuzzing mode.** CVE scanning only; per-submission fuzzing is unbounded compute.
+- **CIS Benchmark.** Adopted relevant controls; full benchmark is future work.
+- **Web Application Firewall beyond Caddy basics.** Single dashboard with JWT auth — rate-limit + body-size cap is sufficient.
 
 ---
 
