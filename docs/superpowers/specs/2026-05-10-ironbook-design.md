@@ -1975,16 +1975,267 @@ make chaos local-1h      # one chaos scenario manually
 
 ---
 
-## 8. Failure Modes & Error Handling — PENDING
+## 8. Failure Modes & Error Handling — APPROVED
 
-> *Planned subsections:*
->
-> 8.1 Submission-side failures (crash, hang, OOM, syscall denial)
-> 8.2 Platform-side failures (gateway crash, oracle crash, telemetry loss)
-> 8.3 Network partition (WG flap, intra-cluster DNS)
-> 8.4 Stateful-store failures (CH down, PG down, MinIO down, Redis down)
-> 8.5 Operator restart and reconciliation safety
-> 8.6 Backpressure rules (drop > block on the hot path)
+A platform that hides its failure modes is a platform that's lying. Six classes of failure, explicit RTO/RPO per data class, hard backpressure rules, manual runbooks.
+
+### 8.1 Failure taxonomy
+
+```mermaid
+flowchart LR
+    F[Failure] --> S["Submission-side<br/>(crash, hang, OOM, deny)"]
+    F --> H["Hot-path component<br/>(gateway, oracle, sidecar)"]
+    F --> D["Stream / storage<br/>(Redpanda, CH, PG, Redis, MinIO)"]
+    F --> N["Network<br/>(WG, intra-cluster DNS, mTLS)"]
+    F --> C["Control plane<br/>(operator, admission, build)"]
+    F --> R["Resource exhaustion<br/>(CPU, mem, fd, disk)"]
+```
+
+For each failure: **Detection** (signal that fires), **Blast radius** (what's affected), **Recovery** (automated path back), **Run impact** (in-flight `BenchmarkRun`s). The platform fails honestly — no silent recoveries that mask throughput; no auto-retry on submission-caused failures.
+
+### 8.2 Submission-side failures
+
+Submissions are untrusted; failures are *expected* and reported as data, not platform errors.
+
+| Mode | Detection | Blast | Recovery | Run impact |
+|---|---|---|---|---|
+| Crash (SIGSEGV / SIGBUS) | k8s pod restart count, gateway connection reset, sidecar EOF | Single run | `ABORTED` with `reason: SubmissionCrash`. **Not auto-retried.** | Run terminates; partial telemetry preserved |
+| Hang (no ack within 10 s) | gateway deadline timer, sidecar hot-socket inactivity > 10 s | Single run | SIGTERM → 5 s grace → SIGKILL. `ABORTED`. | Score = 0 if past correctness gate |
+| OOM kill | k8s `OOMKilled`, kernel `dmesg` ring | Single run | `ABORTED` with `reason: SubmissionOOM`. | Anti-cheat penalty 0.1 |
+| Syscall denial (seccomp ERRNO) | submission `EPERM`, gateway error response | Single run | Submission's own bug; no platform action. | Run continues if handled; aborts if not |
+| Egress attempt | iptables counter, OPA log entry | Single run | Anti-cheat penalty 0.5. | Score impacted; run completes |
+| Fork bomb (pids.max) | cgroup `pids.events.max`, `clone() = EAGAIN` | Single run | Kernel-enforced; observe and `ABORTED`. | Anti-cheat penalty 0.2 |
+| CPU starvation | cgroup `cpu.stat throttled_time` | Single run | Score reflects throttling — measurable property. | None (this is the test) |
+| Image pull failure | `ImagePullBackOff`, `ErrImagePull` | Single run | Retry 3× with exp backoff; persistent → `INSUFFICIENT_CAPACITY` → terminal | Run never starts |
+
+**Hard rule**: never auto-retry submission-caused failures. Auto-retry only for platform-caused failures (chaos, oracle crash, gateway crash) and only via replay against the same input.
+
+### 8.3 Hot-path component failures
+
+Our components — failure here is platform misbehaviour. We report and recover; run scores are invalidated to avoid penalising contestants for our bugs.
+
+#### 8.3.1 fairness-gateway crash
+
+```mermaid
+sequenceDiagram
+    participant Bot as bot-worker
+    participant GW as fairness-gateway
+    participant Sub as submission
+    participant Or as oracle
+    participant Sid as telemetry-sidecar
+    Bot->>GW: order
+    GW->>Sub: stamped order
+    GW->>Or: stamped order
+    Note over GW: CRASH
+    Bot-xGW: order (TCP RST)
+    Bot->>Bot: retry with same client_order_id
+    Note over GW: pod restart ~2s
+    GW-->>Bot: ack (after restart)
+    Note over Sub,Or: in-flight order may have hit one or both;<br/>unmatched side becomes a divergence
+    Sid->>GW: divergence detector emits<br/>SUB_MISSING or ORACLE_MISSING<br/>past watermark
+```
+
+- **Detection**: gRPC liveness probe failed 3× in 6 s.
+- **Blast**: every in-flight run in this region.
+- **Recovery**: pod restart ~2 s; routing config reloaded from operator on startup; bots reconnect via service VIP.
+- **Run impact**: bots retry idempotently; in-flight orders that didn't fork to both sides become divergence events. Run is invalidated only if `ORACLE_MISSING` triggers (our bug — alarm fires).
+
+#### 8.3.2 reference-oracle crash
+
+- **Detection**: liveness; `ORACLE_MISSING` past watermark.
+- **Blast**: single run.
+- **Recovery**: new pod reads `/tmp/oracle-snap.zst` (snapshots every 100k events to PVC); replays Parquet input log from snapshot's last `platform_seq`; resumes producing to same Redpanda offset.
+- **Run impact**: ~5 s blank in oracle stream; submission events during blank flagged `SUB_ONLY`. If > 1% blank, run flagged invalid and auto-replayed against same input when oracle healthy.
+
+#### 8.3.3 telemetry-sidecar crash
+
+- **Detection**: liveness; submission pod still healthy (sidecar in same pod).
+- **Blast**: that submission only.
+- **Recovery**: sidecar restart ~1 s; in-memory ring buffer (5 MB) lost; counter `telemetry_dropped_total` incremented.
+- **Run impact**: missed events counted. Sealing checks `dropped / total < 1%`; if exceeded, run flagged invalid.
+
+#### 8.3.4 time-service crash
+
+- **Detection**: liveness; gateway sees stamp-batch refill fail.
+- **Blast**: cross-run — every gateway in the region.
+- **Recovery**: pod restart ~3 s; persisted high-watermark `last_seq` from PVC; new issuance starts from `last_seq + N` safety gap.
+- **Run impact**: gateway buffers ~10k stamps so most runs don't notice; long-tail orders may see one timeout.
+
+### 8.4 Stream and storage failures
+
+| System | Detection | Blast | Recovery | Run impact |
+|---|---|---|---|---|
+| Redpanda broker down | producer error, consumer disconnect | telemetry stops, control events backlog | StatefulSet restart ~30 s; consumers resume from offset | None on order flow (intra-cluster). Telemetry lags ~1 min. No data loss. |
+| ClickHouse down | ingester insert error rate > 1% | leaderboard freezes; replay queries fail | StatefulSet restart ~1 min; ingester drops to memory buffer, catches up from Redpanda | Leaderboard frozen during outage; runs continue; final scores computable from Redpanda after CH back. |
+| Postgres down | API errors, operator reconcile errors | no new submissions/runs; existing continue | StatefulSet restart ~30 s; operator retries with exp backoff | In-flight runs continue (state in CRDs). Final scoring delayed. |
+| Redis down | scoring engine + leaderboard-api errors | leaderboard frozen | StatefulSet restart ~10 s; ZSET rebuilt from Postgres `ratings` | Scores still computed; not displayed for ~10 s. |
+| MinIO down | replay-engine errors, sealing errors | replay unavailable; sealing waits | StatefulSet restart ~30 s; pipeline buffers replay events to local disk | Completing runs delayed sealing; live runs continue. |
+
+### 8.5 Network failures
+
+#### 8.5.1 Wireguard link down
+
+- **Detection**: `wg show` last-handshake age > 60 s.
+- **Blast**: cross-region mTLS gRPC fails; operator can't reach k3s in B.
+- **Recovery**: WG auto re-establishes (persistent keepalive 25 s); buffers drain.
+- **Run impact**: in-flight runs in B continue (intra-cluster). Telemetry buffers in B's local Redpanda forwarder. Scheduling new runs to B paused.
+
+#### 8.5.2 Intra-cluster DNS failure
+
+- **Detection**: NXDOMAIN; gRPC dial errors.
+- **Blast**: pods can't reach by name; existing TCP connections survive.
+- **Recovery**: CoreDNS DaemonSet restart.
+- **Run impact**: existing connections survive; new runs can't schedule.
+
+#### 8.5.3 mTLS cert expiry
+
+- **Detection**: `certmanager_certificate_expiration_timestamp_seconds` < 1/4 TTL.
+- **Blast**: services fail handshake.
+- **Recovery**: cert-manager auto-rotates at 1/3 TTL before expiry; alert at 1/4 TTL safety net.
+- **Run impact**: should never bite. Manual `kubectl cert-manager renew` if it does.
+
+### 8.6 Control plane failures
+
+| Failure | Detection | Blast | Recovery | Why |
+|---|---|---|---|---|
+| benchmark-operator crash | leader-election lease lost | brief reconcile pause | standby (1 of 2) becomes leader ~5 s | In-flight reconciles resume from CR state |
+| admission-webhook down | webhook health failures | no new pods (`failurePolicy: Fail`) | Deployment auto-restart | Fail closed: admitting unsigned pod is worse than halting |
+| build-runner failure | K8s Job `Failed`; submission stuck `BUILDING` | one submission | controller retries 3× with exp backoff; persistent → `REJECTED` | User sees build log |
+| OPA Gatekeeper down | webhook errors on policy eval | same as admission-webhook | Deployment auto-restart | Fail closed |
+
+### 8.7 Backpressure rules
+
+**The hot path drops; durable layers block.**
+
+| Path | On overflow | Why |
+|---|---|---|
+| bot-worker → gateway TCP | accept queue 1024; SYN-cookies; bot retries | Blocking bots = dishonest measurement |
+| gateway → submission | sync send; gateway times out at 10 s | Slow submission is what we measure |
+| gateway → oracle | symmetric to submission | Same |
+| **telemetry-sidecar buffer** | **drop on full**, increment counter | Lost telemetry honest; back-pressuring sub dishonest |
+| **telemetry-ingester SPSC** | **drop on full**, increment counter | Same — never block the gateway |
+| ingester → ClickHouse | block ingester; upstream feeds buffer in Redpanda | CH is durable; back-pressure is fine |
+| Redpanda producer (control / replay) | block (idempotent retries) | Durable layer; blocking acceptable |
+| operator → API | retry with exp backoff | Reconcile is retried anyway |
+| API → MinIO upload | block; client gets 503 after 30 s | Front-end retries upload |
+
+### 8.8 Recovery objectives (RTO / RPO)
+
+| Data class | RTO | RPO | Mechanism |
+|---|---|---|---|
+| Submission source artefact (MinIO) | 1 min | 0 | Content-addressed; immutable |
+| Submission metadata (Postgres) | 1 min | < 1 min | WAL flush, fsync per commit |
+| Run lifecycle (CRD in etcd) | 1 min | 0 | etcd durable; fsync per CR write |
+| Telemetry events (Redpanda) | 1 min | 100 ms | Idempotent + at-least-once |
+| Telemetry aggregates (ClickHouse) | 5 min | up to last successful flush | Rebuildable from Redpanda |
+| Leaderboard cache (Redis) | 1 min | 0 | Rebuildable from Postgres `ratings` |
+| Replay logs (MinIO Parquet) | 1 min | 0 (sealed atomically) | Object lock on seal |
+| Configuration (manifests in git) | minutes | 0 | git is the source of truth |
+
+No RPO=0 across the board. Telemetry batches in flight when Redpanda dies *can* be lost; we measure and report.
+
+### 8.9 Reconciliation safety
+
+The benchmark-operator's idempotency guarantees:
+
+1. **Reconcile is a pure function of CR state** — no in-memory progression.
+2. **All side effects carry `OwnerReference` to the CR** — pods, certs, routing rules GC'd on CR delete.
+3. **Status updates use `Patch` with `metadata.resourceVersion`** — optimistic concurrency; retry on conflict (max 5).
+4. **Finalizers prevent CR deletion until cleanup confirmed.**
+5. **State transitions check from-state.**
+
+```go
+// pseudocode
+func (r *BenchmarkRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    var br ironbookv1.BenchmarkRun
+    if err := r.Get(ctx, req.NamespacedName, &br); err != nil {
+        return ctrl.Result{}, client.IgnoreNotFound(err)
+    }
+
+    if !br.DeletionTimestamp.IsZero() {
+        return r.handleDelete(ctx, &br)
+    }
+    if !controllerutil.ContainsFinalizer(&br, ironbookFinalizer) {
+        controllerutil.AddFinalizer(&br, ironbookFinalizer)
+        return ctrl.Result{}, r.Update(ctx, &br)
+    }
+
+    switch br.Status.Phase {
+    case "":            return r.transitionToPending(ctx, &br)
+    case "PENDING":     return r.transitionToAllocating(ctx, &br)
+    case "ALLOCATING":  return r.transitionToPriming(ctx, &br)
+    case "PRIMING":     return r.transitionToRunning(ctx, &br)
+    case "RUNNING":     return r.observeRunning(ctx, &br)
+    case "DRAINING":    return r.transitionToComplete(ctx, &br)
+    case "COMPLETE":    return ctrl.Result{}, nil
+    case "ABORTED",
+         "INVALID",
+         "INSUFFICIENT_CAPACITY",
+         "GATEWAY_REJECT": return ctrl.Result{}, nil   // terminal
+    default:
+        return ctrl.Result{}, fmt.Errorf("unknown phase %q", br.Status.Phase)
+    }
+}
+```
+
+Every transition is idempotent: checks side-effect existence, creates if missing. Resuming from any state machine point is safe.
+
+### 8.10 Resource exhaustion
+
+| Resource | Hard limit | Detection | Recovery |
+|---|---|---|---|
+| Submission CPU | cgroup `cpu.max = 200000 100000` (2 cores) | `cpu.stat throttled_time` | Score reflects throttling |
+| Submission memory | cgroup `memory.max = 1Gi` | OOMKill | `ABORTED` |
+| Submission PIDs | cgroup `pids.max = 100` | `pids.events.max` | Anti-cheat flag |
+| Submission disk | `ephemeral-storage: 256Mi`, `tmp: 64Mi` (memory) | EmptyDir size limit | Pod evicted, run aborted |
+| Node disk | StatefulSet PVC quotas; node 80 GB SSD | `node_filesystem_avail_bytes` | Argo CD blocks new submissions; manual cleanup |
+| File descriptors (gateway) | `ulimit -n 65535` | `process_open_fds` | Pod restart (rare; symptom of leak) |
+| Redpanda log volume | 50 GB PV; tiered to MinIO after 24 h | broker disk metric | Tiered offload, then disk reclaim |
+
+### 8.11 Manual runbook (lives in `docs/runbooks/`)
+
+```
+RUNBOOK-01: oracle pod CrashLooping
+  1. kubectl logs -l app=oracle -p
+  2. Check /tmp/oracle-snap.zst integrity:
+       kubectl exec ... -- file /tmp/oracle-snap.zst
+  3. If snap corrupted, run is invalidated; operator emits status=INVALID.
+  4. Manual replay possible:
+       ironbookctl replay --run <id> --target-submission <sub_sha>
+
+RUNBOOK-02: WG link won't re-establish
+  1. wg show on both ends; check last-handshake.
+  2. Verify Hetzner outbound UDP 51820 not blocked.
+  3. wg-quick down ironbook && wg-quick up ironbook.
+  4. If still failing, check time-service skew (>5s breaks WG handshake).
+
+RUNBOOK-03: ClickHouse won't accept inserts (DiskFull)
+  1. clickhouse-client -q "SELECT name, disks_in_use FROM system.disks"
+  2. Hot tier full but cold (S3) has capacity:
+       clickhouse-client -q "SYSTEM MOVE PARTS"
+  3. Reduce TTL on runs_raw if needed:
+       ALTER TABLE runs_raw MODIFY TTL inserted_at + 3 DAY
+  4. Argo CD: bump PVC size in deploy/manifests/clickhouse/sts.yaml; commit.
+
+RUNBOOK-04: leaderboard frozen but ClickHouse green
+  1. Check Redis ZSET cardinality: redis-cli ZCARD leaderboard:default
+  2. If 0, scoring-engine restart will rebuild from Postgres.
+  3. kubectl rollout restart deploy/scoring-engine.
+
+RUNBOOK-05: A run is "stuck" in PRIMING
+  1. kubectl describe benchmarkrun <id>
+  2. Look for most recent Status.Condition with Reason field.
+  3. Common: cert-manager Certificate didn't issue (CA expired? rate-limited?).
+  4. kubectl get certificates -n submissions; investigate.
+```
+
+### 8.12 Out of scope
+
+- Multi-region disaster recovery (single-region by design).
+- Automated backup-and-restore drills (PG dumps daily, MinIO mirror weekly; no game-day exercises).
+- Postmortem templating (template exists; not a spec concern).
+- SLA commitments to "users" (single-user demo platform).
+- Active/active hot standby of platform components beyond operator leader/standby.
 
 ---
 
