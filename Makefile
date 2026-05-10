@@ -2,7 +2,7 @@ SHELL := /usr/bin/env bash
 .SHELLFLAGS := -eu -o pipefail -c
 export PATH := $(HOME)/.cargo/bin:$(PATH)
 .DEFAULT_GOAL := help
-.PHONY: help proto build lint fmt test-unit test-integ ci-local dev dev-up dev-down
+.PHONY: help proto build lint fmt test-unit test-integ ci-local dev dev-up dev-down demo
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS=":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -37,4 +37,11 @@ dev-up: ## Bring up local kind cluster
 
 dev-down: ## Tear down local kind cluster
 	./tools/kindcluster/down.sh
+
+dev: dev-up ## Bring up local cluster + apply dev overlay
+	KUBECONFIG=$$PWD/kubeconfig.local kubectl create ns cert-manager --dry-run=client -o yaml | kubectl --kubeconfig $$PWD/kubeconfig.local apply -f -
+	KUBECONFIG=$$PWD/kubeconfig.local kubectl create ns argocd --dry-run=client -o yaml | kubectl --kubeconfig $$PWD/kubeconfig.local apply -f -
+	KUBECONFIG=$$PWD/kubeconfig.local kubectl create ns gatekeeper-system --dry-run=client -o yaml | kubectl --kubeconfig $$PWD/kubeconfig.local apply -f -
+	KUBECONFIG=$$PWD/kubeconfig.local kubectl --kubeconfig $$PWD/kubeconfig.local apply -k deploy/manifests/overlays/dev --server-side
+	KUBECONFIG=$$PWD/kubeconfig.local kubectl rollout status -n cert-manager deploy/cert-manager-webhook --timeout=300s
 
