@@ -1,0 +1,18 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: admission-webhook
+  namespace: ironbook
+spec:
+  secretName: admission-webhook-tls
+  dnsNames:
+    - admission-webhook.ironbook.svc
+    - admission-webhook.ironbook.svc.cluster.local
+  duration: 8760h     # 1 year for the demo (cert-manager auto-rotates)
+  renewBefore: 720h   # rotate 30 days before expiry
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: ironbook-ca-issuer
+    kind: Issuer

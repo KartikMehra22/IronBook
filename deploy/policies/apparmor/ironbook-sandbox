@@ -1,0 +1,32 @@
+# AppArmor profile for IronBook submission containers.
+# Loaded by deploy/manifests/base/sandbox-host/daemonset.yaml on Linux nodes
+# whose kernel supports AppArmor. On the kind-on-Mac demo host, the kernel
+# (Docker Desktop's Linux VM) does not load AppArmor profiles — the file
+# ships and the manifest applies, but the profile is inactive (ADR-011).
+profile ironbook-sandbox flags=(attach_disconnected, mediate_deleted) {
+  #include <abstractions/base>
+
+  capability,
+  deny capability sys_admin,
+  deny capability sys_module,
+  deny capability sys_ptrace,
+  deny capability sys_rawio,
+  deny capability sys_boot,
+  deny capability net_admin,
+  deny capability net_raw,
+
+  /tmp/** rw,
+  /var/run/sidecar/sock rw,
+  /proc/self/** r,
+  /proc/[0-9]*/** r,
+  deny /proc/sys/** rwklx,
+  deny /sys/** rwklx,
+  deny /etc/shadow* rwklx,
+  deny /root/** rwklx,
+  deny /var/log/** rwklx,
+
+  network inet stream,
+  network inet6 stream,
+  deny network packet,
+  deny network raw,
+}

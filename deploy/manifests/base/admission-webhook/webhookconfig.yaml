@@ -1,0 +1,27 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: ironbook-admission
+  annotations:
+    cert-manager.io/inject-ca-from: ironbook/admission-webhook
+webhooks:
+  - name: validate.ironbook.io
+    sideEffects: None
+    admissionReviewVersions: [v1]
+    failurePolicy: Fail
+    timeoutSeconds: 5
+    clientConfig:
+      service:
+        name: admission-webhook
+        namespace: ironbook
+        path: /validate
+        port: 443
+      # caBundle injected by cert-manager via the inject-ca-from annotation.
+    rules:
+      - operations: [CREATE]
+        apiGroups: [""]
+        apiVersions: [v1]
+        resources: [pods]
+    namespaceSelector:
+      matchLabels:
+        ironbook.io/sandbox: "true"

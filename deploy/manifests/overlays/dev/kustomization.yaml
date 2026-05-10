@@ -10,3 +10,10 @@ resources:
   - ../../base/registry
   - ../../base/build-runner
   - ../../base/submission-api
+  - ../../base/sandbox-host
+  - ../../base/admission-webhook
+  - ../../base/fairness-gateway
+  # The gvisor RuntimeClass ships alongside the rest. On Mac/kind it resolves
+  # to the default runtime per ADR-011; on a Linux host with runsc installed
+  # (RUNBOOK-06), submission pods land on gVisor.
+  - ../../../runtimeclasses/gvisor.yaml

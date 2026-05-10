@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: admission-webhook
+  namespace: ironbook
+  labels:
+    app: admission-webhook
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: admission-webhook
+  template:
+    metadata:
+      labels:
+        app: admission-webhook
+    spec:
+      containers:
+        - name: webhook
+          image: ironbook/admission-webhook:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: https
+              containerPort: 8443
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8443
+              scheme: HTTPS
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits:   { cpu: "200m", memory: "128Mi" }
+      volumes:
+        - name: tls
+          secret:
+            secretName: admission-webhook-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: admission-webhook
+  namespace: ironbook
+spec:
+  selector:
+    app: admission-webhook
+  ports:
+    - name: https
+      port: 443
+      targetPort: 8443
