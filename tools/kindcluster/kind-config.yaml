@@ -1,0 +1,20 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: ironbook-control
+networking:
+  apiServerAddress: 127.0.0.1
+  apiServerPort: 6443
+nodes:
+  - role: control-plane
+    extraMounts:
+      - hostPath: ./deploy/policies/seccomp
+        containerPath: /var/lib/kubelet/seccomp
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            seccomp-default: "true"
+            allowed-unsafe-sysctls: ""
+  - role: worker
+  - role: worker

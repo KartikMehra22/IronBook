@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: ironbook
+resources:
+  - statefulset.yaml
+  - service.yaml
+  # secret-template.yaml is a template only; apply via kubectl manually for dev
+  # or via SealedSecret in CI/prod. NOT included here so kustomize re-applies
+  # don't overwrite user-set passwords.

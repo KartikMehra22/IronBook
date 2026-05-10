@@ -1,0 +1,67 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: build-runner
+  namespace: builds
+---
+# Build-runner reads its own pod logs (for failure surfacing) and creates
+# nothing else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: build-runner
+  namespace: builds
+rules:
+  - apiGroups: [""]
+    resources: [pods, pods/log]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: build-runner
+  namespace: builds
+subjects:
+  - kind: ServiceAccount
+    name: build-runner
+    namespace: builds
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: build-runner
+---
+# submission-api runs in `ironbook` namespace and creates Jobs in `builds`.
+# It needs cluster-scope access to batch/v1 Jobs in `builds` only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: dispatcher
+  namespace: builds
+rules:
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [get, list, watch, create, delete]
+  - apiGroups: [""]
+    resources: [pods, pods/log]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: submission-api-dispatcher
+  namespace: builds
+subjects:
+  - kind: ServiceAccount
+    name: submission-api
+    namespace: ironbook
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: dispatcher
+---
+# ServiceAccount for the submission-api in the ironbook namespace.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: submission-api
+  namespace: ironbook

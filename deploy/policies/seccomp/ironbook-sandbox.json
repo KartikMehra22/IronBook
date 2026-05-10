@@ -1,0 +1,40 @@
+{
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "defaultErrnoRet": 1,
+  "syscalls": [
+    {
+      "action": "SCMP_ACT_ALLOW",
+      "names": [
+        "read", "write", "close", "fstat", "stat", "lstat", "newfstatat",
+        "mmap", "mprotect", "munmap", "brk",
+        "rt_sigaction", "rt_sigprocmask", "rt_sigreturn",
+        "ioctl", "pread64", "pwrite64", "readv", "writev",
+        "access", "faccessat", "faccessat2",
+        "pipe", "pipe2", "select", "pselect6", "poll", "ppoll",
+        "sched_yield", "mremap", "msync", "mincore", "madvise",
+        "clone", "clone3", "execve", "exit", "exit_group",
+        "wait4", "waitid", "kill", "tgkill", "tkill",
+        "uname", "fcntl", "getdents64", "getcwd",
+        "openat", "open", "readlinkat", "readlink",
+        "getpid", "getppid", "gettid",
+        "sendfile", "sendfile64",
+        "socket", "connect", "accept", "accept4",
+        "sendto", "recvfrom", "sendmsg", "recvmsg",
+        "shutdown", "bind", "listen", "getsockname", "getpeername",
+        "setsockopt", "getsockopt",
+        "futex", "futex_waitv",
+        "epoll_create1", "epoll_create", "epoll_ctl", "epoll_wait", "epoll_pwait",
+        "eventfd2", "eventfd", "timerfd_create", "timerfd_settime",
+        "nanosleep", "clock_gettime", "clock_nanosleep",
+        "getrandom", "prlimit64",
+        "set_tid_address", "arch_prctl", "set_robust_list", "get_robust_list",
+        "rseq",
+        "setresuid", "setresgid", "setuid", "setgid",
+        "geteuid", "getegid", "getuid", "getgid",
+        "getrusage",
+        "dup", "dup2", "dup3",
+        "lseek", "ftruncate"
+      ]
+    }
+  ]
+}

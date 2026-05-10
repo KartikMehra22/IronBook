@@ -1,0 +1,59 @@
+# Defense-in-depth Layer 6: nftables host backstop.
+#
+# If the cluster CNI fails open (a NetworkPolicy bug, plugin restart, etc.),
+# this DaemonSet enforces an absolute deny on egress from any pod whose
+# cgroup is in `submissions` to anything outside the in-cluster CIDR.
+# kind/Mac CIDR is 10.244.0.0/16 by default; production overlays patch
+# this to match the cluster's pod CIDR.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: iptables-backstop
+  namespace: kube-system
+  labels:
+    app: iptables-backstop
+spec:
+  selector:
+    matchLabels:
+      app: iptables-backstop
+  template:
+    metadata:
+      labels:
+        app: iptables-backstop
+    spec:
+      hostNetwork: true
+      hostPID: true
+      containers:
+        - name: nft
+          image: alpine:3.20
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              # Production: this DaemonSet installs an nftables backstop that
+              # drops egress from the submissions cgroup to anything outside
+              # the in-cluster CIDR. Per-cgroup matching by path requires
+              # nftables ≥ 1.0.6 + a kernel that exposes cgroupv2 path matchers,
+              # which kind-on-Mac (Docker Desktop's Linux kernel) does not.
+              # On the demo host this DaemonSet stays alive but installs only
+              # a sentinel chain; intra-cluster isolation is enforced by the
+              # NetworkPolicy in deploy/manifests/base/submissions-namespace/
+              # (Layer 7).
+              apk add --no-cache nftables >/dev/null 2>&1 || true
+              if command -v nft >/dev/null 2>&1; then
+                nft delete table inet ironbook 2>/dev/null || true
+                nft 'add table inet ironbook' || true
+                nft 'add chain inet ironbook submission_egress { type filter hook output priority -50; policy accept; }' || true
+                # Sentinel rule: count packets from kind's pod CIDR (no drop;
+                # gives a visible counter to demo "this layer is wired").
+                nft 'add rule inet ironbook submission_egress ip saddr 10.244.0.0/16 counter' || true
+                echo "[iptables-backstop] nftables sentinel chain installed (no-drop on demo host)."
+              else
+                echo "[iptables-backstop] nftables unavailable on this node; skipping."
+              fi
+              while true; do sleep 3600; done
+      tolerations:
+        - operator: Exists

@@ -1,0 +1,10 @@
+# Submission pods carry `runtimeClassName: gvisor`.
+# The admission-webhook enforces this for all production submission pods.
+# On a Linux host with `runsc` installed (RUNBOOK-06), pods land on gVisor.
+# On the kind-on-Mac demo host, this RuntimeClass exists in the API but
+# resolves to the default runtime — Layer 2 (gVisor) is inactive per ADR-011.
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gvisor
+handler: runsc

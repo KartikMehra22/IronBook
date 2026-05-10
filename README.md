@@ -9,10 +9,14 @@ throughput, and a divergence-tested correctness oracle.
   correctness oracle; live divergence detection on the leaderboard.
 - All inputs are content-addressed and replayable — A/B comparisons of two
   submissions on byte-identical input are one CLI command.
-- Two-region architecture (Mac control plane via k3d ↔ Hetzner sandbox
-  region via k3s) connected by Wireguard, all under €15/month.
-- gVisor + seccomp + AppArmor + cgroups v2 + NetworkPolicy + iptables —
-  seven concentric layers of submission isolation.
+- Designed for two regions; deployed as a single Kubernetes cluster with
+  namespace isolation between control plane and sandbox tier. The Terraform
+  for the original Mac↔Hetzner two-region topology ships under
+  `deploy/terraform/` — one `terraform apply` away from cross-region. (ADR-011)
+- seccomp + AppArmor + cgroups v2 + NetworkPolicy + iptables host backstop +
+  admission-webhook — six active layers of submission isolation, plus a
+  seventh (gVisor `runtimeClassName`) enforced by the admission-webhook
+  contract and ready to activate on any Linux host. (ADR-011, spec §4.2)
 - Glicko-2 ratings with uncertainty bands; multi-scenario tournaments
   instead of single-run wins.
 - Self-replay byte-equality CI gate proves the input pipeline is

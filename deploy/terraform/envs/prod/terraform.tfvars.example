@@ -1,0 +1,3 @@
+hcloud_token      = "REPLACE_ME_WITH_HCLOUD_API_TOKEN"
+hcloud_ssh_key_id = 0    # numeric ID from `hcloud ssh-key list` or the Hetzner Cloud Console
+mac_endpoint      = ""   # leave empty if Mac is behind NAT; sandbox dials in via WG

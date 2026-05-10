@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base/cert-manager
+  - ../../base/argocd
+  - ../../base/opa-gatekeeper
+  - ../../base/submissions-namespace
+  - ../../base/postgres
+  - ../../base/minio
+  - ../../base/registry
+  - ../../base/build-runner
+  - ../../base/submission-api
+  - ../../base/sandbox-host
+  - ../../base/admission-webhook
+  - ../../base/fairness-gateway
+  # The gvisor RuntimeClass ships alongside the rest. On Mac/kind it resolves
+  # to the default runtime per ADR-011; on a Linux host with runsc installed
+  # (RUNBOOK-06), submission pods land on gVisor.
+  - ../../../runtimeclasses/gvisor.yaml

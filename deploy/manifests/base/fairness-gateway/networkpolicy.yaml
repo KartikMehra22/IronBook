@@ -1,0 +1,23 @@
+# Per-pod allow rule: bots in the `submissions` namespace may reach the
+# fairness-gateway on :8080. The cross-ns deny default (in
+# deploy/manifests/base/submissions-namespace/networkpolicy.yaml) blocks
+# everything else; this NP unblocks the legitimate path.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-ingress-from-submissions
+  namespace: submissions
+spec:
+  podSelector:
+    matchLabels:
+      app: fairness-gateway
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}   # any pod within the `submissions` namespace
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ironbook   # control-plane services may also poke the gateway
+      ports:
+        - port: 8080
+          protocol: TCP

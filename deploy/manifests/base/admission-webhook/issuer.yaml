@@ -1,0 +1,34 @@
+# Self-signed CA used to mint the admission-webhook serving cert.
+# Production replaces this with a SPIFFE/cert-manager intermediate.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: ironbook-selfsigned
+  namespace: ironbook
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ironbook-ca
+  namespace: ironbook
+spec:
+  isCA: true
+  commonName: ironbook-ca
+  secretName: ironbook-ca-tls
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: ironbook-selfsigned
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: ironbook-ca-issuer
+  namespace: ironbook
+spec:
+  ca:
+    secretName: ironbook-ca-tls

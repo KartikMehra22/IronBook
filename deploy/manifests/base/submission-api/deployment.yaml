@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: submission-api
+  namespace: ironbook
+  labels:
+    app: submission-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: submission-api
+  template:
+    metadata:
+      labels:
+        app: submission-api
+    spec:
+      serviceAccountName: submission-api
+      containers:
+        - name: api
+          image: ironbook/submission-api:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: IRONBOOK_HTTP_ADDR
+              value: ":8080"
+            - name: IRONBOOK_PG_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres
+                  key: user
+            - name: IRONBOOK_PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres
+                  key: password
+            - name: IRONBOOK_POSTGRES_DSN
+              value: "postgres://$(IRONBOOK_PG_USER):$(IRONBOOK_PG_PASSWORD)@postgres:5432/ironbook?sslmode=disable"
+            - name: IRONBOOK_MINIO_ENDPOINT
+              value: "minio:9000"
+            - name: IRONBOOK_MINIO_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio
+                  key: user
+            - name: IRONBOOK_MINIO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio
+                  key: password
+            - name: IRONBOOK_MINIO_BUCKET
+              value: "submissions"
+            - name: IRONBOOK_MINIO_USE_SSL
+              value: "false"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }

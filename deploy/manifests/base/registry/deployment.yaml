@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: registry
+  namespace: ironbook
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: registry
+  template:
+    metadata:
+      labels:
+        app: registry
+    spec:
+      containers:
+        - name: zot
+          image: ghcr.io/project-zot/zot-linux-arm64:v2.1.0
+          args: ["serve", "/etc/zot/config.json"]
+          ports:
+            - containerPort: 5000
+          volumeMounts:
+            - name: cfg
+              mountPath: /etc/zot
+            - name: data
+              mountPath: /var/lib/registry
+          readinessProbe:
+            httpGet:
+              path: /v2/
+              port: 5000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: cfg
+          configMap:
+            name: zot-config
+        - name: data
+          emptyDir:
+            sizeLimit: 5Gi

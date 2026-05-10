@@ -1,0 +1,78 @@
+# Distributes the IronBook seccomp profile to every kubelet's
+# /var/lib/kubelet/seccomp directory and (where the kernel supports it)
+# loads the AppArmor profile via apparmor_parser.
+#
+# On kind-on-Mac the kubelet seccomp dir is bind-mounted from
+# deploy/policies/seccomp/ via the kind-config (so this DaemonSet is
+# a no-op on the demo host but mandatory on real Linux clusters).
+# AppArmor loading is best-effort: nodes whose kernel doesn't support
+# AppArmor exit cleanly without erroring (ADR-011).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: sandbox-host
+  namespace: kube-system
+  labels:
+    app: sandbox-host
+spec:
+  selector:
+    matchLabels:
+      app: sandbox-host
+  template:
+    metadata:
+      labels:
+        app: sandbox-host
+    spec:
+      hostPID: false
+      containers:
+        - name: profile-distributor
+          image: alpine:3.20
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              echo "[sandbox-host] copying seccomp profile to host kubelet dir..."
+              mkdir -p /host-seccomp
+              cp /profiles/ironbook-sandbox.json /host-seccomp/
+              echo "[sandbox-host] seccomp profile installed."
+              if [ -e /sys/kernel/security/apparmor/profiles ]; then
+                echo "[sandbox-host] AppArmor detected — loading profile..."
+                apk add --no-cache apparmor-utils >/dev/null 2>&1 || true
+                if command -v apparmor_parser >/dev/null 2>&1; then
+                  apparmor_parser -r -W /profiles/ironbook-sandbox.apparmor || \
+                    echo "[sandbox-host] AppArmor parser returned non-zero (kernel may lack policy support)"
+                else
+                  echo "[sandbox-host] apparmor_parser not available; skipping load"
+                fi
+              else
+                echo "[sandbox-host] AppArmor not exposed by kernel (expected on kind/Mac); skipping load"
+              fi
+              echo "[sandbox-host] done; sleeping for liveness..."
+              while true; do sleep 3600; done
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          volumeMounts:
+            - name: profiles
+              mountPath: /profiles
+              readOnly: true
+            - name: host-seccomp
+              mountPath: /host-seccomp
+            - name: host-securityfs
+              mountPath: /sys/kernel/security
+              mountPropagation: HostToContainer
+      tolerations:
+        - operator: Exists
+      volumes:
+        - name: profiles
+          configMap:
+            name: ironbook-profiles
+        - name: host-seccomp
+          hostPath:
+            path: /var/lib/kubelet/seccomp
+            type: DirectoryOrCreate
+        - name: host-securityfs
+          hostPath:
+            path: /sys/kernel/security
+            type: DirectoryOrCreate
