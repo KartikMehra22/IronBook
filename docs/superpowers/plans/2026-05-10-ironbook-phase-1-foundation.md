@@ -1296,79 +1296,116 @@ git commit -m "feat(terraform): add prod env composition (Hetzner sandbox VM + W
 
 ---
 
-### Task 3.4: Provision Hetzner + WG handshake
+### Task 3.4: Single-cluster two-namespace setup *(REVISED per ADR-011)*
 
-(Manual one-time bring-up — record steps in a runbook.)
+The original plan provisioned a Hetzner ARM VM and joined it to a Wireguard mesh. Per ADR-011 the operator does not have cloud budget for the hackathon; the Terraform from Tasks 3.1-3.3 ships as IaC deliverable but is not applied. Instead, we co-locate both tiers in the existing kind cluster with namespace isolation:
+
+- `ironbook` (existing) — control plane
+- `submissions` (new) — sandbox region
+
+Cross-tier traffic is shaped by NetworkPolicy. `tc netem` between namespace pod CIDRs simulates cross-region latency in chaos scenarios when needed.
 
 **Files:**
-- Create: `docs/runbooks/02-bring-up-hetzner.md`
+- Create: `deploy/manifests/base/submissions-namespace/{namespace,resourcequota,limits}.yaml,kustomization.yaml`
+- Create: `docs/runbooks/02-single-cluster-bringup.md`
 
-- [ ] **Step 1: Get Hetzner Cloud API token + SSH key uploaded**
+- [ ] **Step 1: Namespace + ResourceQuota + LimitRange** (replaces the Hetzner VM)
 
-Manual: Hetzner Cloud Console → Project → Security → API Tokens → create read+write. Upload your local SSH key under SSH Keys.
-
-- [ ] **Step 2: Create `terraform.tfvars` from example, fill in token + ssh-key-id**
-
-```bash
-cd deploy/terraform/envs/prod
-cp terraform.tfvars.example terraform.tfvars
-$EDITOR terraform.tfvars
+`deploy/manifests/base/submissions-namespace/namespace.yaml`:
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: submissions
+  labels:
+    ironbook.io/sandbox: "true"
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit:   restricted
+    pod-security.kubernetes.io/warn:    restricted
 ```
 
-- [ ] **Step 3: `terraform init && terraform apply`**
-
-```bash
-terraform init
-terraform apply
+`deploy/manifests/base/submissions-namespace/resourcequota.yaml`:
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata: { name: submissions, namespace: submissions }
+spec:
+  hard:
+    pods: "16"
+    requests.cpu:    "8"
+    requests.memory: "8Gi"
+    limits.cpu:      "16"
+    limits.memory:   "16Gi"
 ```
 
-Expected: server provisioned (~2 min); volume attached; WG configs generated under `.wg/`.
-
-- [ ] **Step 4: Bring WG up on Mac**
-
-```bash
-sudo cp .wg/control/wg-quick.conf /etc/wireguard/ironbook.conf
-sudo wg-quick up ironbook
-sudo wg show
+`deploy/manifests/base/submissions-namespace/limits.yaml`:
+```yaml
+apiVersion: v1
+kind: LimitRange
+metadata: { name: submissions-defaults, namespace: submissions }
+spec:
+  limits:
+    - type: Container
+      default:        { cpu: "1",   memory: "512Mi" }
+      defaultRequest: { cpu: "500m", memory: "256Mi" }
+      max:            { cpu: "2",   memory: "1Gi" }
 ```
 
-- [ ] **Step 5: Bring WG up on Hetzner via SSH**
-
-```bash
-SANDBOX_IP=$(terraform output -raw sandbox_ip)   # add this output to outputs.tf if missing
-scp .wg/sandbox/wg-quick.conf root@$SANDBOX_IP:/etc/wireguard/ironbook.conf
-ssh root@$SANDBOX_IP 'wg-quick up ironbook && wg show'
+`kustomization.yaml`:
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources: [namespace.yaml, resourcequota.yaml, limits.yaml]
 ```
 
-- [ ] **Step 6: Verify mesh connectivity**
+Wire `../../base/submissions-namespace` into `deploy/manifests/overlays/dev/kustomization.yaml`.
+
+- [ ] **Step 2: Apply**
 
 ```bash
-ping -c 3 10.99.0.2   # sandbox WG IP
+KUBECONFIG=$PWD/kubeconfig.local kubectl apply -k deploy/manifests/overlays/dev
+KUBECONFIG=$PWD/kubeconfig.local kubectl get ns submissions -o yaml | grep "ironbook.io/sandbox"
+KUBECONFIG=$PWD/kubeconfig.local kubectl -n submissions get resourcequota,limitrange
 ```
 
-Expected: ping succeeds.
+- [ ] **Step 3: NetworkPolicy — deny cross-namespace traffic by default in submissions**
 
-- [ ] **Step 7: Pull k3s kubeconfig over WG**
+`deploy/manifests/base/submissions-namespace/networkpolicy.yaml`:
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: deny-cross-ns-default, namespace: submissions }
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: submissions }
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: submissions }
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports: [ { port: 53, protocol: UDP } ]
+```
+
+Add to the kustomization. Note: per-pod allow rules (e.g., gateway → submission) are layered on top in Day 6.
+
+- [ ] **Step 4: Write the runbook** (`docs/runbooks/02-single-cluster-bringup.md`) — document namespace creation, NetworkPolicy enforcement, how to add a Hetzner second region later via the unchanged Terraform.
+
+- [ ] **Step 5: Commit**
 
 ```bash
-ssh root@$SANDBOX_IP 'cat /etc/rancher/k3s/k3s.yaml' \
-  | sed "s|127.0.0.1|10.99.0.2|" \
-  > kubeconfig.sandbox
-KUBECONFIG=$PWD/kubeconfig.sandbox kubectl get nodes
+git add deploy/manifests/base/submissions-namespace/ deploy/manifests/overlays/dev/ docs/runbooks/02-single-cluster-bringup.md
+git commit -m "feat(deploy): add submissions namespace with ResourceQuota + LimitRange + cross-ns deny NetworkPolicy"
 ```
 
-Expected: 1 node Ready.
-
-- [ ] **Step 8: Write the runbook capturing all the above** (`docs/runbooks/02-bring-up-hetzner.md`)
-
-Document each step verbatim so you can rebuild from scratch.
-
-- [ ] **Step 9: Commit**
-
-```bash
-git add docs/runbooks/02-bring-up-hetzner.md
-git commit -m "docs(runbooks): add Hetzner + Wireguard bring-up runbook"
-```
+**Future-work pointer:** when cloud budget exists, re-run the *original* Day 3.4 against `deploy/terraform/envs/prod/` (Tasks 3.1-3.3 produced it) to provision Hetzner + Wireguard. The cluster contexts switch from kind-only to kind + Hetzner k3s, the operator targets both, and the existing manifests re-deploy untouched.
 
 ---
 
@@ -2792,60 +2829,68 @@ git commit -m "test(e2e): phase-1 smoke — upload Rust hello-world reaches stat
 
 ---
 
-## Day 6 — Sandbox runtime + admission webhook + stub gateway (~7 tasks, ~7 hours)
+## Day 6 — Sandbox runtime + admission webhook + stub gateway (~7 tasks, ~6 hours) *(REVISED per ADR-011)*
 
-### Task 6.1: Install gVisor on Hetzner k3s
+Per ADR-011 we skip the gVisor binary install (Apple Silicon kind cannot run runsc as the outer runtime). The `RuntimeClass` manifest still ships and is enforced by the admission-webhook contract, but on the demo host pods fall through to the default `runc` runtime. The other six isolation layers (seccomp, AppArmor, cgroups v2, NetworkPolicy, iptables host backstop, admission-webhook) are deployed and active.
 
-(Manual one-time install; record in runbook.)
+### Task 6.1: Document the gVisor install path *(REVISED — no binary install)*
 
 **Files:**
-- Modify: `docs/runbooks/02-bring-up-hetzner.md`
+- Create: `docs/runbooks/06-gvisor-activation-on-linux.md`
 
-- [ ] **Step 1: SSH into Hetzner sandbox VM**
+- [ ] **Step 1: Write the runbook** that captures the `runsc` install + containerd config the *original* Task 6.1 specified, but framed as "run this on a Linux host (e.g. Hetzner via the Terraform from Tasks 3.1-3.3) when ready to activate Layer 2".
 
-```bash
-ssh root@10.99.0.2
-```
+```markdown
+# RUNBOOK-06: Activate gVisor (Layer 2) on a Linux host
 
-- [ ] **Step 2: Install runsc**
+The IronBook admission-webhook already enforces `runtimeClassName: gvisor`
+on every submission pod. The `RuntimeClass` resource ships in
+`deploy/runtimeclasses/gvisor.yaml`. On a Linux host (e.g., a Hetzner ARM
+VM provisioned via `deploy/terraform/envs/prod/`), `runsc` activates Layer 2
+of the seven-layer isolation chain.
+
+## Steps (on the Linux host)
 
 ```bash
 ARCH=$(uname -m | sed s/aarch64/arm64/)
 URL="https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}"
-wget ${URL}/runsc ${URL}/runsc.sha512 ${URL}/containerd-shim-runsc-v1 ${URL}/containerd-shim-runsc-v1.sha512
+wget ${URL}/runsc ${URL}/runsc.sha512 \
+     ${URL}/containerd-shim-runsc-v1 ${URL}/containerd-shim-runsc-v1.sha512
 sha512sum -c runsc.sha512 -c containerd-shim-runsc-v1.sha512
 chmod a+rx runsc containerd-shim-runsc-v1
-mv runsc containerd-shim-runsc-v1 /usr/local/bin/
-```
+sudo mv runsc containerd-shim-runsc-v1 /usr/local/bin/
 
-- [ ] **Step 3: Configure k3s containerd to know about runsc**
-
-```bash
-mkdir -p /var/lib/rancher/k3s/agent/etc/containerd/
-cat > /var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl <<'EOF'
+# k3s: extend containerd config
+sudo mkdir -p /var/lib/rancher/k3s/agent/etc/containerd/
+sudo tee /var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl > /dev/null <<'EOF'
 {{ template "base" . }}
 
 [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runsc]
   runtime_type = "io.containerd.runsc.v1"
 EOF
-systemctl restart k3s
+sudo systemctl restart k3s
 ```
 
-- [ ] **Step 4: Verify**
+## Verify
 
 ```bash
-systemctl status k3s
-crictl info | grep -A3 runtimes   # should list 'runsc'
-exit
+crictl info | grep -A3 runtimes   # 'runsc' listed
+kubectl apply -f deploy/runtimeclasses/gvisor.yaml
+kubectl get runtimeclass gvisor   # exists
 ```
 
-- [ ] **Step 5: Update `02-bring-up-hetzner.md` with these steps**
+## Hackathon-time fallback
 
-- [ ] **Step 6: Commit**
+For the kind-on-Mac demo we *do not* run this; submission pods land on
+`runc` (the kind default). Layer 2 is documented as future-work in spec
+§10.1.
+```
+
+- [ ] **Step 2: Commit**
 
 ```bash
-git add docs/runbooks/02-bring-up-hetzner.md
-git commit -m "docs(runbooks): document gVisor install on Hetzner k3s"
+git add docs/runbooks/06-gvisor-activation-on-linux.md
+git commit -m "docs(runbooks): document gVisor activation on Linux hosts (ADR-011)"
 ```
 
 ---
@@ -3361,13 +3406,15 @@ func main() {
 # (omit verbose YAML repetition — same shape as submission-api)
 ```
 
-- [ ] **Step 3: Apply to sandbox cluster** (this lives in Region B because gateway is regional)
+- [ ] **Step 3: Apply to the local kind cluster, namespace `submissions`** *(REVISED per ADR-011: single cluster, namespace-isolated)*
 
 ```bash
 docker build -t ironbook/fairness-gateway:dev -f apps/fairness-gateway/Dockerfile .
-docker save ironbook/fairness-gateway:dev | ssh root@10.99.0.2 'k3s ctr images import -'
-KUBECONFIG=$PWD/kubeconfig.sandbox kubectl apply -k deploy/manifests/base/stub-fairness-gateway
+kind load docker-image ironbook/fairness-gateway:dev --name ironbook-control
+KUBECONFIG=$PWD/kubeconfig.local kubectl apply -k deploy/manifests/base/stub-fairness-gateway
 ```
+
+The deployment manifest must declare `namespace: submissions` (not `ironbook`) so it lands in the sandbox tier.
 
 - [ ] **Step 4: Commit**
 
@@ -3378,7 +3425,9 @@ git commit -m "feat(fairness-gateway): stub server that acks orders (real impl P
 
 ---
 
-### Task 6.7: E2E smoke — submission pod runs in gVisor, gateway acks
+### Task 6.7: E2E smoke — submission pod runs in `submissions` namespace, gateway acks *(REVISED per ADR-011)*
+
+The original task ran the submission pod under `runtimeClassName: gvisor` on the Hetzner k3s node. On the kind/Mac demo host we drop the runtimeClass (the admission-webhook still requires it for *non-test* submission pods; we mark this smoke pod with `ironbook.io/test=true` to bypass that single check). Layers 1, 3, 4, 5, 6, 7 still apply.
 
 **Files:**
 - Create: `tests/e2e/cases/phase1_sandbox_smoke_test.go`
@@ -3415,9 +3464,12 @@ kind: Pod
 metadata:
   name: submission-smoke
   namespace: submissions
-  labels: { app: submission, ironbook.io/run: smoke }
+  labels:
+    app: submission
+    ironbook.io/run:  smoke
+    ironbook.io/test: "true"   # admission-webhook bypass for the demo smoke
 spec:
-  runtimeClassName: gvisor
+  # runtimeClassName: gvisor  # original; kept in production manifests; omitted for kind/Mac demo (ADR-011)
   serviceAccountName: default
   hostNetwork: false
   hostPID: false
@@ -3426,7 +3478,9 @@ spec:
     runAsNonRoot: true
     runAsUser: 65534
     runAsGroup: 65534
-    seccompProfile: { type: Localhost, localhostProfile: ironbook-sandbox.json }
+    # seccompProfile mounted by the admission-webhook for non-test submissions; this smoke pod
+    # uses the kubelet's default seccomp (`seccomp-default: "true"` is set on kind nodes via
+    # tools/kindcluster/kind-config.yaml).
   containers:
     - name: engine
       image: registry.ironbook.svc:5000/sub/<SHA256>@sha256:<DIGEST>
@@ -3442,35 +3496,39 @@ spec:
 
 (Substitute `<SHA256>` and `<DIGEST>` from the prior upload's READY status.)
 
-- [ ] **Step 3: Smoke test**
+- [ ] **Step 3: Smoke test** *(REVISED — local kind cluster)*
 
 ```bash
-KUBECONFIG=$PWD/kubeconfig.sandbox kubectl apply -f tests/e2e/manifests/submission-pod-smoke.yaml
-KUBECONFIG=$PWD/kubeconfig.sandbox kubectl wait pod/submission-smoke -n submissions --for=condition=Ready --timeout=60s
+KUBECONFIG=$PWD/kubeconfig.local kubectl apply -f tests/e2e/manifests/submission-pod-smoke.yaml
+KUBECONFIG=$PWD/kubeconfig.local kubectl wait pod/submission-smoke -n submissions --for=condition=Ready --timeout=60s
 
 # Port-forward into the pod and curl it.
-KUBECONFIG=$PWD/kubeconfig.sandbox kubectl -n submissions port-forward submission-smoke 7777:7777 &
+KUBECONFIG=$PWD/kubeconfig.local kubectl -n submissions port-forward submission-smoke 7777:7777 &
 PF_PID=$!
 sleep 1
 curl -fsSL http://localhost:7777/ | grep -q "ack"
 kill $PF_PID
 ```
 
-Expected: `ack` line returned. The pod is running under runsc, sealed by all the layers from Day 6.
+Expected: `ack` line returned. The pod is running under `runc` (kind default), sealed by Layers 1, 3, 4, 5, 6, 7. Layer 2 (gVisor) is enforced by the admission-webhook contract for production submissions; the smoke pod's `ironbook.io/test=true` label exempts only this demo pod from the runtimeClass requirement (ADR-011).
 
-- [ ] **Step 4: Verify gVisor actually used**
+- [ ] **Step 4: Verify isolation layers active** *(REVISED — runc on kind, not runsc)*
 
 ```bash
-KUBECONFIG=$PWD/kubeconfig.sandbox kubectl -n submissions exec submission-smoke -- /bin/sh -c 'cat /proc/1/cgroup' || echo "[expected: shell denied by AppArmor]"
-KUBECONFIG=$PWD/kubeconfig.sandbox kubectl -n submissions describe pod submission-smoke | grep -i runtimeclass
+KUBECONFIG=$PWD/kubeconfig.local kubectl -n submissions exec submission-smoke -- /bin/sh -c 'echo hi' 2>&1 | head -3
+# Expected: "exec ... no such file or directory" (distroless has no shell); OR AppArmor deny.
+
+KUBECONFIG=$PWD/kubeconfig.local kubectl -n submissions describe pod submission-smoke \
+  | grep -E "AppArmor|seccomp|securityContext|RuntimeClass"
+# Expected: AppArmor profile `ironbook-sandbox` (Layer 4), seccompProfile (Layer 3),
+# securityContext drops ALL capabilities (Layer 1). RuntimeClass blank for the smoke
+# pod; production submissions enforce `gvisor` via the admission-webhook.
 ```
 
-Expected: shell denied (AppArmor blocks `sh` exec or distroless image has none); RuntimeClass `gvisor`.
-
-- [ ] **Step 5: Send an order to the gateway and verify ack**
+- [ ] **Step 5: Send an order to the gateway and verify ack** *(REVISED — local kind cluster)*
 
 ```bash
-KUBECONFIG=$PWD/kubeconfig.sandbox kubectl -n ironbook port-forward svc/fairness-gateway 8080:8080 &
+KUBECONFIG=$PWD/kubeconfig.local kubectl -n submissions port-forward svc/fairness-gateway 8080:8080 &
 sleep 1
 curl -sX POST http://localhost:8080/v1/order -d '{"client_order_id":"abc"}' | grep platform_seq
 kill %1

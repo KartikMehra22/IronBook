@@ -212,6 +212,7 @@ flowchart TB
 - **Kafka.** Redpanda is API-compatible, single binary, no JVM, no Zookeeper.
 - **A separate scheduler service.** The benchmark-operator *is* the scheduler. Adding another would be Conway's-Law cosplay.
 - **WASM execution mode.** Mentioned as a runtime-class plug-point; not implemented.
+- **True cross-region deployment for the hackathon submission.** See ADR-011. The two-region Terraform (`deploy/terraform/`) ships as part of the IaC deliverable and is one `terraform apply` away from the spec's original two-region topology (Mac k3d ↔ Hetzner k3s over Wireguard). For the demo we co-locate both tiers in a single kind cluster with namespace isolation between `ironbook` (control plane) and `submissions` (sandbox region). Cross-tier traffic is shaped by the same NetworkPolicy rules the original cross-cluster design applies; latency between tiers can be simulated with `tc netem` in chaos scenarios when judges want to see the cross-region story.
 
 ---
 
@@ -701,7 +702,7 @@ T6 is unusual but real for HFT — explaining how we defeat it is a credibility 
 
 ### 4.2 Defense-in-depth — submission pod isolation (the T1 + T2 wall)
 
-Seven concentric layers. A bypass of any one must still hit the next.
+Seven concentric layers as designed. For the hackathon submission, six are deployed and the seventh (gVisor) is enforced by the admission-webhook contract but ships unactivated — see ADR-011 and the call-out below the diagram.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -718,7 +719,10 @@ Seven concentric layers. A bypass of any one must still hit the next.
 │  │   │   │   │   ┌──────────────────────────────────────────┐ │ │ │ │    │
 │  │   │   │   │   │       LAYER 3: seccomp-bpf               │ │ │ │ │    │
 │  │   │   │   │   │   ┌────────────────────────────────────┐ │ │ │ │ │    │
-│  │   │   │   │   │   │   LAYER 2: gVisor user-space kernel │ │ │ │ │ │    │
+│  │   │   │   │   │   │ LAYER 2: gVisor (DEPLOYED ON LINUX)│ │ │ │ │ │    │
+│  │   │   │   │   │   │  enforced by admission-webhook;    │ │ │ │ │ │    │
+│  │   │   │   │   │   │  inactive on kind/Mac demo host    │ │ │ │ │ │    │
+│  │   │   │   │   │   │  (ADR-011)                         │ │ │ │ │ │    │
 │  │   │   │   │   │   │   ┌──────────────────────────────┐ │ │ │ │ │ │    │
 │  │   │   │   │   │   │   │ LAYER 1: pod securityContext │ │ │ │ │ │ │    │
 │  │   │   │   │   │   │   │  • runAsNonRoot              │ │ │ │ │ │ │    │
@@ -735,6 +739,8 @@ Seven concentric layers. A bypass of any one must still hit the next.
 │  └──────────────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
+
+**Layer 2 status (ADR-011):** the admission-webhook enforces `runtimeClassName: gvisor` on every submission pod. The `RuntimeClass` resource is in `deploy/manifests/runtimeclasses/gvisor.yaml`. On the kind-on-Mac demo host, gVisor (runsc) is not the active container runtime — it requires Linux KVM or a hypervisor that the M3 Pro Apple Silicon nested-virt path does not expose. On any Linux host with `runsc` installed (the Terraform `cloud-init.yaml` for Hetzner does this in one line), Layer 2 activates with zero code changes. Layers 1, 3, 4, 5, 6, 7 are *deployed and active* on the demo host.
 
 #### 4.2.1 Pod manifest enforced by the admission-webhook
 
@@ -2724,11 +2730,13 @@ ADRs in docs/adr/. Runbooks in docs/runbooks/.
 Consolidated from the "Out of scope" subsection of each preceding section. Captured here as a single reading so a judge can see the trajectory beyond the prototype without trawling 9 sections.
 
 ### 10.1 Sandbox & runtime
+- **gVisor (runsc) activation on a Linux host.** The full integration is shipped — admission-webhook enforces `runtimeClassName: gvisor`, the `RuntimeClass` manifest is in `deploy/manifests/runtimeclasses/`, and the Terraform `cloud-init.yaml` installs `runsc` on Hetzner. For the demo we run on kind/Mac where Layer 2 (gVisor) is the only one of the seven isolation layers not active. Activates with one `terraform apply`. (ADR-011, §4.2)
 - **Firecracker microVM runtime class.** Adds VM-level isolation; requires KVM-capable bare metal. Slot in as a third `RuntimeClass` next to `gvisor` and `runc`. (§4.9)
 - **WASM execution mode.** Ironclad cross-architecture isolation for submissions willing to compile to WASI. Plug-point already exists at the runtime-class layer. (§1.5)
 
 ### 10.2 Scale & topology
-- **Multi-region sandbox** with DNS failover (Hetzner FRA + HEL). Operator-managed scheduling across regions; sub-pod Anti-Affinity by region. (§1.5, §8.12)
+- **Two-region deployment (Mac k3d ↔ Hetzner k3s over Wireguard).** The original spec §1 architecture; Terraform modules (`deploy/terraform/modules/hetzner-vm`, `modules/wireguard`) and the `envs/prod` composition ship as part of the IaC deliverable. For the hackathon we co-locate both tiers in a single kind cluster with namespace isolation between `ironbook` and `submissions`, plus `tc netem` for simulated cross-region latency in chaos scenarios. Activates with `terraform apply` once cloud budget exists (~€10/month Hetzner CCX21, or zero on Oracle Cloud Always Free). (ADR-011, §1.5)
+- **Multi-region sandbox** with DNS failover (Hetzner FRA + HEL). Operator-managed scheduling across regions; sub-pod Anti-Affinity by region. Builds on top of the two-region deployment above. (§8.12)
 - **Sharded Redpanda + ClickHouse** for > 100 k orders / s. Currently single-broker / single-node; the blueprint sections document how the partitioning would extend. (§3.11)
 - **Service mesh (Linkerd preferred over Istio)** at > 50 services. Today's mTLS-via-cert-manager pattern works; adding mesh becomes worth it past ~50 services where uniform observability outweighs the operational cost. (§1.5)
 

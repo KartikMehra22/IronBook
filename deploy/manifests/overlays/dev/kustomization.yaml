@@ -4,6 +4,7 @@ resources:
   - ../../base/cert-manager
   - ../../base/argocd
   - ../../base/opa-gatekeeper
+  - ../../base/submissions-namespace
   - ../../base/postgres
   - ../../base/minio
   - ../../base/submission-api
