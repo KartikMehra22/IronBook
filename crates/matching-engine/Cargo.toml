@@ -1,0 +1,15 @@
+[package]
+name        = "matching-engine"
+version     = "0.0.1"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde      = { workspace = true }
+thiserror  = { workspace = true }
+
+[dev-dependencies]
+proptest   = { workspace = true }
+
+[lints]
+workspace = true

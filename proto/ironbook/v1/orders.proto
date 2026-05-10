@@ -1,0 +1,35 @@
+syntax = "proto3";
+package ironbook.v1;
+option go_package = "github.com/KartikMehra22/IronBook/pkg/proto/ironbook/v1;ironbookv1";
+
+enum Side { SIDE_UNSPECIFIED = 0; BID = 1; ASK = 2; }
+enum OrderType { ORDER_TYPE_UNSPECIFIED = 0; LIMIT = 1; MARKET = 2; }
+enum TimeInForce { TIF_UNSPECIFIED = 0; GTC = 1; IOC = 2; FOK = 3; }
+
+message NormalizedOrder {
+  uint64 platform_seq      = 1;
+  uint64 platform_ts_ns    = 2;
+  bytes  client_order_id   = 3; // u128 packed (bot_id, local_seq)
+  bytes  session_token     = 4; // 32 bytes opaque
+  Side   side              = 5;
+  uint64 qty               = 6;
+  int64  price             = 7; // ticks; integer math
+  OrderType order_type     = 8;
+  TimeInForce tif          = 9;
+}
+
+message Ack {
+  uint64 platform_seq = 1;
+  uint64 ack_ts_ns    = 2;
+  uint32 status       = 3; // 0 = ok
+  string message      = 4;
+}
+
+message Fill {
+  uint64 trade_id            = 1;
+  uint64 platform_seq_taker  = 2;
+  uint64 platform_seq_maker  = 3;
+  int64  price               = 4;
+  uint64 qty                 = 5;
+  uint64 ts_ns               = 6;
+}

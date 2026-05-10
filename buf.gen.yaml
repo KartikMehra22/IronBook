@@ -1,0 +1,11 @@
+version: v2
+inputs:
+  - directory: proto
+plugins:
+  - remote: buf.build/protocolbuffers/go
+    out: pkg/proto
+    opt: [paths=source_relative]
+  - remote: buf.build/community/neoeinstein-prost
+    out: crates/proto/src/gen
+  - remote: buf.build/community/neoeinstein-tonic
+    out: crates/proto/src/gen
