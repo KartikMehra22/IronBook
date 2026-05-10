@@ -7,7 +7,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-func ptrBool(b bool) *bool   { return &b }
+func ptrBool(b bool) *bool    { return &b }
 func ptrStr(s string) *string { return &s }
 
 func compliantPod(test bool) *corev1.Pod {

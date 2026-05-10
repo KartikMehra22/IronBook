@@ -6,9 +6,9 @@ import "github.com/kelseyhightower/envconfig"
 // Config holds the per-job parameters supplied by the dispatching K8s Job.
 type Config struct {
 	// Submission metadata
-	SubmissionID string `envconfig:"SUBMISSION_ID" required:"true"`
-	SubmissionSha256 string `envconfig:"SUBMISSION_SHA256" required:"true"` // hex-encoded
-	Language string `envconfig:"SUBMISSION_LANGUAGE" required:"true"` // rust|go|cpp
+	SubmissionID     string `envconfig:"SUBMISSION_ID" required:"true"`
+	SubmissionSha256 string `envconfig:"SUBMISSION_SHA256" required:"true"`   // hex-encoded
+	Language         string `envconfig:"SUBMISSION_LANGUAGE" required:"true"` // rust|go|cpp
 
 	// Where to read source from
 	MinIOEndpoint  string `envconfig:"MINIO_ENDPOINT" required:"true"`

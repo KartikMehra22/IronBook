@@ -40,9 +40,9 @@ type Result struct {
 // Build packages a single binary file into a container image whose
 // ENTRYPOINT runs that binary, then pushes to `registryRef`.
 //
-//   binaryPath     local path to the compiled binary
-//   contestantSha  hex-encoded sha256 of the original source archive
-//   registry       registry host:port (e.g. "registry.ironbook.svc:5000")
+//	binaryPath     local path to the compiled binary
+//	contestantSha  hex-encoded sha256 of the original source archive
+//	registry       registry host:port (e.g. "registry.ironbook.svc:5000")
 //
 // The final image is pushed to `<registry>/sub/<contestantSha>:latest` and
 // returned with its remote digest.
