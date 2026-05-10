@@ -8,4 +8,5 @@ resources:
   - ../../base/postgres
   - ../../base/minio
   - ../../base/registry
+  - ../../base/build-runner
   - ../../base/submission-api

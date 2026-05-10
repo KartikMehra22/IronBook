@@ -15,6 +15,7 @@ spec:
       labels:
         app: submission-api
     spec:
+      serviceAccountName: submission-api
       containers:
         - name: api
           image: ironbook/submission-api:dev

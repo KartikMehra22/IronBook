@@ -4,4 +4,6 @@ namespace: ironbook
 resources:
   - statefulset.yaml
   - service.yaml
-  - secret-template.yaml
+  # secret-template.yaml is a template only; apply via kubectl manually for dev
+  # or via SealedSecret in CI/prod. NOT included here so kustomize re-applies
+  # don't overwrite user-set passwords.

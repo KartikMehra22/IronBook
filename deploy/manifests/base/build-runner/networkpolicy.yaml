@@ -1,0 +1,48 @@
+# Build-pod NetworkPolicy.
+#
+# Phase 1 (demo): permissive egress — build pods need to reach gcr.io for the
+# distroless base image, crates.io for Rust deps, and proxy.golang.org for Go
+# modules. The intra-cluster sinks (Zot, MinIO, Postgres) are also allowed.
+#
+# Phase 4 hardens this to truly hermetic by:
+#   1. Mirroring upstream registries into the in-cluster Zot.
+#   2. Standing up an internal Cargo + Go module proxy.
+#   3. Restricting egress to in-cluster only.
+# Tracked in ADR-012 / spec §10.4.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: builds-egress-permissive-for-demo
+  namespace: builds
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    # Intra-cluster: Zot + MinIO + Postgres + kube-dns
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ironbook
+      ports:
+        - port: 5000  # Zot
+        - port: 9000  # MinIO
+        - port: 5432  # Postgres
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Public internet: HTTPS for upstream registries + crates.io + proxy.golang.org.
+    # Phase 4 replaces this rule with in-cluster mirrors.
+    - ports:
+        - port: 443
+          protocol: TCP
+        - port: 80
+          protocol: TCP

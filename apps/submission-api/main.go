@@ -6,7 +6,11 @@ import (
 	"log"
 	"net/http"
 
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+
 	"github.com/KartikMehra22/IronBook/apps/submission-api/config"
+	"github.com/KartikMehra22/IronBook/apps/submission-api/dispatcher"
 	"github.com/KartikMehra22/IronBook/apps/submission-api/repo"
 	"github.com/KartikMehra22/IronBook/apps/submission-api/server"
 	"github.com/KartikMehra22/IronBook/apps/submission-api/service"
@@ -35,9 +39,27 @@ func main() {
 		log.Fatalf("ensure bucket: %v", err)
 	}
 
+	// Build a dispatcher that runs Jobs against the in-cluster K8s API.
+	// In tests, the dispatcher is nil and Upload skips the build step.
+	var disp *dispatcher.Dispatcher
+	if kCfg, kErr := rest.InClusterConfig(); kErr == nil {
+		cli, cErr := kubernetes.NewForConfig(kCfg)
+		if cErr != nil {
+			log.Fatalf("k8s client: %v", cErr)
+		}
+		disp = &dispatcher.Dispatcher{
+			Client:    cli,
+			Image:     "ironbook/build-runner:dev",
+			Namespace: "builds",
+		}
+	} else {
+		log.Printf("not running in-cluster (rest.InClusterConfig: %v); build dispatch disabled", kErr)
+	}
+
 	svc := &service.Service{
 		PG:    &repo.Postgres{Pool: pg.Pool},
 		MinIO: &repo.MinIO{C: mc},
+		Disp:  disp,
 	}
 	srv := &server.Server{Svc: svc}
 
