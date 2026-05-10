@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: submission-api
+  namespace: ironbook
+spec:
+  selector:
+    app: submission-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

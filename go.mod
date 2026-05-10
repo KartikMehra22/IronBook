@@ -1,6 +1,6 @@
 module github.com/KartikMehra22/IronBook
 
-go 1.26.3
+go 1.23
 
 require (
 	github.com/google/uuid v1.6.0
