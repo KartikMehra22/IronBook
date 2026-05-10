@@ -1,6 +1,6 @@
 version: v2
 modules:
-  - path: ironbook
+  - path: .
 breaking:
   use: [FILE]
 lint:
