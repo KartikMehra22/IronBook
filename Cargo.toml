@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/matching-engine", "crates/ironbookctl"]
+members = ["crates/matching-engine", "crates/ironbookctl", "crates/proto"]
 resolver = "2"
 
 [workspace.package]

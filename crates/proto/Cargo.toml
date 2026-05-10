@@ -1,0 +1,15 @@
+[package]
+name              = "ironbook-proto"
+version           = "0.0.1"
+edition.workspace = true
+
+[dependencies]
+prost = "0.13"
+tonic = { version = "0.12", optional = true }
+
+[features]
+default = []
+grpc    = ["dep:tonic"]
+
+[lints]
+workspace = true

@@ -1,0 +1,9 @@
+syntax = "proto3";
+package ironbook.v1;
+option go_package = "github.com/KartikMehra22/IronBook/pkg/proto/ironbook/v1;ironbookv1";
+
+message BenchmarkRunRef {
+  bytes  run_id        = 1; // 16 bytes UUID v7
+  string scenario_hash = 2;
+  string submission_sha256 = 3;
+}
