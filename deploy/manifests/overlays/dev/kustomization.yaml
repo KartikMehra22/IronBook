@@ -7,4 +7,5 @@ resources:
   - ../../base/submissions-namespace
   - ../../base/postgres
   - ../../base/minio
+  - ../../base/registry
   - ../../base/submission-api
