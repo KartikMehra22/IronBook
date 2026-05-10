@@ -1,0 +1,37 @@
+# Build artefacts
+target/
+node_modules/
+dist/
+.next/
+*.exe
+
+# Go
+/coverage.out
+*.test
+
+# Rust
+**/*.rs.bk
+Cargo.lock.bak
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Secrets
+*.tfvars
+!*.tfvars.example
+*.pem
+*.key
+.env*
+!.env.example
+
+# Generated bindings (regenerable)
+crates/proto/src/gen/
+pkg/proto/
+
+# Local k8s state
+kubeconfig.local
