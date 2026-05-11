@@ -4,4 +4,21 @@ modules:
 breaking:
   use: [FILE]
 lint:
-  use: [DEFAULT]
+  # STANDARD replaces the deprecated DEFAULT category (same set of rules).
+  use: [STANDARD]
+  # Stylistic carve-outs:
+  # - SERVICE_SUFFIX: we name services after the noun (OrderIntake), not
+  #   OrderIntakeService. Both styles are well-attested in real-world protos
+  #   (Google's own protos are split). Keeping the noun aligns with the
+  #   matching-engine / fairness-gateway domain vocabulary throughout the
+  #   spec (§3.4, §3.5).
+  # - RPC_REQUEST_STANDARD_NAME / RPC_RESPONSE_STANDARD_NAME: our RPCs accept
+  #   and return the canonical domain types (NormalizedOrder, Reply) directly
+  #   rather than wrapping them in dedicated SubmitRequest / SubmitResponse
+  #   envelopes. The IronBook protos are internal-only; if we ever need to
+  #   add per-RPC fields we'll introduce the wrappers then (and remove these
+  #   exceptions).
+  except:
+    - SERVICE_SUFFIX
+    - RPC_REQUEST_STANDARD_NAME
+    - RPC_RESPONSE_STANDARD_NAME
