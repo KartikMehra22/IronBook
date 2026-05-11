@@ -1,0 +1,6 @@
+## Append samples of your project ##
+resources:
+- ironbook_v1_submission.yaml
+- ironbook_v1_scenario.yaml
+- ironbook_v1_botswarm.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
