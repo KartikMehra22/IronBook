@@ -1,0 +1,9 @@
+apiVersion: ironbook.ironbook.io/v1
+kind: Submission
+metadata:
+  labels:
+    app.kubernetes.io/name: benchmark-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: submission-sample
+spec:
+  # TODO(user): Add fields here

@@ -1,0 +1,9 @@
+apiVersion: ironbook.ironbook.io/v1
+kind: Scenario
+metadata:
+  labels:
+    app.kubernetes.io/name: benchmark-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: scenario-sample
+spec:
+  # TODO(user): Add fields here

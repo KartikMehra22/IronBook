@@ -1,0 +1,38 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - ironbook.ironbook.io
+  resources:
+  - botswarms
+  - scenarios
+  - submissions
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ironbook.ironbook.io
+  resources:
+  - botswarms/finalizers
+  - scenarios/finalizers
+  - submissions/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - ironbook.ironbook.io
+  resources:
+  - botswarms/status
+  - scenarios/status
+  - submissions/status
+  verbs:
+  - get
+  - patch
+  - update
