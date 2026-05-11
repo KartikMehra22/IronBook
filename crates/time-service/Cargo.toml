@@ -1,0 +1,15 @@
+[package]
+name              = "time-service"
+version           = "0.0.1"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio          = { workspace = true }
+tonic          = { version = "0.14", features = ["transport", "server", "channel"] }
+prost          = "0.14"
+ironbook-proto = { path = "../proto" }
+anyhow         = { workspace = true }
+
+[lints]
+workspace = true

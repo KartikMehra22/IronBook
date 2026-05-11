@@ -143,6 +143,14 @@ impl TimeInForce {
         }
     }
 }
+/// Reply bundles the per-order ack with the resulting fills.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Reply {
+    #[prost(message, optional, tag="1")]
+    pub ack: ::core::option::Option<Ack>,
+    #[prost(message, repeated, tag="2")]
+    pub fills: ::prost::alloc::vec::Vec<Fill>,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BenchmarkRunRef {
     /// 16 bytes UUID v7
@@ -153,4 +161,28 @@ pub struct BenchmarkRunRef {
     #[prost(string, tag="3")]
     pub submission_sha256: ::prost::alloc::string::String,
 }
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NextStampsRequest {
+    /// Number of (seq, ts) stamps to reserve. Clamped to \[1, 65535\] by the
+    /// server. The server reserves a contiguous block; the client emits them
+    /// sequentially.
+    #[prost(uint32, tag="1")]
+    pub batch_size: u32,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NextStampsResponse {
+    /// First sequence number of the reserved range, inclusive.
+    #[prost(uint64, tag="1")]
+    pub first_seq: u64,
+    /// First nanosecond timestamp corresponding to first_seq.
+    #[prost(uint64, tag="2")]
+    pub first_ts_ns: u64,
+    /// Suggested nanosecond spacing for client-local interpolation.
+    #[prost(uint64, tag="3")]
+    pub step_ns: u64,
+    /// Actual batch size granted (== request.batch_size after clamping).
+    #[prost(uint32, tag="4")]
+    pub batch_size: u32,
+}
+include!("ironbook.v1.tonic.rs");
 // @@protoc_insertion_point(module)

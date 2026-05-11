@@ -2,10 +2,17 @@ version: v2
 inputs:
   - directory: proto
 plugins:
+  # Go message + enum types
   - remote: buf.build/protocolbuffers/go
     out: pkg/proto
     opt: [paths=source_relative]
+  # Go gRPC client + server stubs
+  - remote: buf.build/grpc/go
+    out: pkg/proto
+    opt: [paths=source_relative, require_unimplemented_servers=false]
+  # Rust prost messages
   - remote: buf.build/community/neoeinstein-prost
     out: crates/proto/src/gen
+  # Rust tonic services
   - remote: buf.build/community/neoeinstein-tonic
     out: crates/proto/src/gen

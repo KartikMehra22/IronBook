@@ -1,0 +1,18 @@
+syntax = "proto3";
+package ironbook.v1;
+option go_package = "github.com/KartikMehra22/IronBook/pkg/proto/ironbook/v1;ironbookv1";
+
+import "ironbook/v1/orders.proto";
+
+// OrderIntake is the wire contract that the reference-oracle (and every
+// contestant submission) exposes. The fairness-gateway forwards every
+// NormalizedOrder to both the submission and the oracle in parallel.
+service OrderIntake {
+  rpc Submit(NormalizedOrder) returns (Reply);
+}
+
+// Reply bundles the per-order ack with the resulting fills.
+message Reply {
+  Ack          ack   = 1;
+  repeated Fill fills = 2;
+}

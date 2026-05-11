@@ -3,13 +3,13 @@ name              = "ironbook-proto"
 version           = "0.0.1"
 edition.workspace = true
 
+# Tonic + prost are always-on: the prost-generated file unconditionally
+# `include!`s the tonic-generated file, so gating tonic behind a feature
+# would require post-processing the codegen output. Keeping it simple.
 [dependencies]
-prost = "0.13"
-tonic = { version = "0.12", optional = true }
-
-[features]
-default = []
-grpc    = ["dep:tonic"]
+prost       = "0.14"
+tonic       = { version = "0.14", features = ["transport", "codegen", "server", "channel"] }
+tonic-prost = "0.14"
 
 [lints]
 workspace = true

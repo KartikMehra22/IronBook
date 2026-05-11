@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/matching-engine", "crates/ironbookctl", "crates/proto"]
+members = [
+    "crates/matching-engine",
+    "crates/ironbookctl",
+    "crates/proto",
+    "crates/time-service",
+    "crates/reference-oracle",
+]
 resolver = "2"
 
 [workspace.package]
