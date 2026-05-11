@@ -1,70 +1,81 @@
-// Command fairness-gateway is the IronBook proxy that stamps every order with
-// platform-issued (seq, ts) before forwarding to a contestant's submission.
-// Phase 1 ships a stub that just acks orders for end-to-end smoke testing.
-// Phase 2 replaces this with the real stamping + identity-stripping + fork-
-// to-oracle gateway (see spec §3.4).
+// Command fairness-gateway is the IronBook hot-path proxy.
+//
+// For every order from a bot:
+//  1. Reserve a (platform_seq, platform_ts_ns) stamp from the time-service.
+//  2. Strip the bot's identity (replace bot_id with sha256(bot_id || run_secret)).
+//  3. Fan out the normalised order to BOTH the submission and the reference
+//     oracle in parallel.
+//  4. Return the submission's reply to the bot; tee both replies to the sink
+//     so the divergence-detector can join them downstream.
+//
+// REST on POST /v1/order. WebSocket on /v1/order/ws. Health on /healthz.
 package main
 
 import (
-	"encoding/json"
+	"encoding/hex"
 	"log"
 	"net/http"
-	"os"
-	"sync/atomic"
-	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	"github.com/KartikMehra22/IronBook/apps/fairness-gateway/config"
+	"github.com/KartikMehra22/IronBook/apps/fairness-gateway/gateway"
+	"github.com/KartikMehra22/IronBook/apps/fairness-gateway/transport"
+	pb "github.com/KartikMehra22/IronBook/pkg/proto/ironbook/v1"
 )
 
-// Order is the wire shape the stub accepts.
-type Order struct {
-	ClientOrderID string `json:"client_order_id"`
-}
-
-// Ack is the wire shape returned to bots/clients.
-type Ack struct {
-	ClientOrderID string `json:"client_order_id"`
-	PlatformSeq   uint64 `json:"platform_seq"`
-	AckTsNs       int64  `json:"ack_ts_ns"`
-	GatewayPhase  string `json:"gateway_phase"` // "stub" until Phase 2
-}
-
-var seq atomic.Uint64
-
 func main() {
-	addr := envOr("IRONBOOK_ADDR", ":8080")
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
+
+	timeConn := mustDial(cfg.TimeService)
+	subConn := mustDial(cfg.SubmissionEnd)
+	orConn := mustDial(cfg.OracleEnd)
+	defer timeConn.Close()
+	defer subConn.Close()
+	defer orConn.Close()
+
+	stamper := gateway.NewStamper(pb.NewTimeServiceClient(timeConn), cfg.StampBatchSize)
+
+	sink, err := gateway.NewFileSink(cfg.EventLogPath)
+	if err != nil {
+		log.Fatalf("file sink: %v", err)
+	}
+	defer sink.Close()
+
+	fork := &gateway.Fork{
+		Submission: pb.NewOrderIntakeClient(subConn),
+		Oracle:     pb.NewOrderIntakeClient(orConn),
+		Sink:       sink,
+	}
+
+	secret, err := hex.DecodeString(cfg.RunSecret)
+	if err != nil {
+		log.Fatalf("decode run secret: %v", err)
+	}
+	srv := &gateway.Server{Stamper: stamper, Fork: fork, RunSecret: secret}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/order", handleOrder)
+	mux.HandleFunc("/v1/order", srv.HandleOrder)
+	mux.HandleFunc("/v1/order/ws", transport.WSHandler(srv))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	})
-	log.Printf("stub fairness-gateway listening on %s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+
+	log.Printf("fairness-gateway listening on %s (time=%s sub=%s oracle=%s)",
+		cfg.HTTPAddr, cfg.TimeService, cfg.SubmissionEnd, cfg.OracleEnd)
+	if err := http.ListenAndServe(cfg.HTTPAddr, mux); err != nil { //nolint:gosec
 		log.Fatalf("serve: %v", err)
 	}
 }
 
-func handleOrder(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+func mustDial(addr string) *grpc.ClientConn {
+	c, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Fatalf("dial %s: %v", addr, err)
 	}
-	var o Order
-	if err := json.NewDecoder(r.Body).Decode(&o); err != nil {
-		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	ack := Ack{
-		ClientOrderID: o.ClientOrderID,
-		PlatformSeq:   seq.Add(1),
-		AckTsNs:       time.Now().UnixNano(),
-		GatewayPhase:  "stub",
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(ack)
-}
-
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
+	return c
 }

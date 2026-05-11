@@ -3,6 +3,7 @@ module github.com/KartikMehra22/IronBook
 go 1.25.0
 
 require (
+	github.com/coder/websocket v1.8.13
 	github.com/google/go-containerregistry v0.20.2
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.6.0
