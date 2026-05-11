@@ -1,15 +1,21 @@
 [package]
-name        = "matching-engine"
-version     = "0.0.1"
+name              = "matching-engine"
+version           = "0.0.1"
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-serde      = { workspace = true }
-thiserror  = { workspace = true }
+serde     = { workspace = true }
+thiserror = { workspace = true }
+bincode   = { version = "2", features = ["serde"] }
 
 [dev-dependencies]
-proptest   = { workspace = true }
+proptest  = { workspace = true }
+criterion = "0.5"
+
+[[bench]]
+name    = "throughput"
+harness = false
 
 [lints]
 workspace = true
