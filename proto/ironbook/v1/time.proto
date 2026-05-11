@@ -1,0 +1,29 @@
+syntax = "proto3";
+package ironbook.v1;
+option go_package = "github.com/KartikMehra22/IronBook/pkg/proto/ironbook/v1;ironbookv1";
+
+// TimeService issues monotonic (platform_seq, platform_ts_ns) stamps used by
+// the fairness-gateway to label every order before it is forwarded to a
+// submission or the reference oracle. Clients fetch batches (typically 10k
+// at a time) to amortise the RPC.
+service TimeService {
+  rpc NextStamps(NextStampsRequest) returns (NextStampsResponse);
+}
+
+message NextStampsRequest {
+  // Number of (seq, ts) stamps to reserve. Clamped to [1, 65535] by the
+  // server. The server reserves a contiguous block; the client emits them
+  // sequentially.
+  uint32 batch_size = 1;
+}
+
+message NextStampsResponse {
+  // First sequence number of the reserved range, inclusive.
+  uint64 first_seq    = 1;
+  // First nanosecond timestamp corresponding to first_seq.
+  uint64 first_ts_ns  = 2;
+  // Suggested nanosecond spacing for client-local interpolation.
+  uint64 step_ns      = 3;
+  // Actual batch size granted (== request.batch_size after clamping).
+  uint32 batch_size   = 4;
+}

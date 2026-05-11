@@ -12,6 +12,7 @@
 pub mod gen {
     pub mod ironbook {
         pub mod v1 {
+            // Single include — the prost file appends the tonic include at its bottom.
             include!("gen/ironbook/v1/ironbook.v1.rs");
         }
     }
