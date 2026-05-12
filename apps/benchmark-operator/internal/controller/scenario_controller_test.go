@@ -51,7 +51,12 @@ var _ = Describe("Scenario Controller", func() {
 						Name:      resourceName,
 						Namespace: "default",
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: ironbookv1.ScenarioSpec{
+						YAMLSpec:        "kind: scenario\n",
+						Seed:            1,
+						DurationSeconds: 5,
+						Targets:         ironbookv1.ScenarioTargets{P50Us: 10, P99Us: 100, TPS: 1000},
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}

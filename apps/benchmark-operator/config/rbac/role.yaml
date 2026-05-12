@@ -5,8 +5,21 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - ironbook.ironbook.io
   resources:
+  - benchmarkruns
   - botswarms
   - scenarios
   - submissions
@@ -21,6 +34,7 @@ rules:
 - apiGroups:
   - ironbook.ironbook.io
   resources:
+  - benchmarkruns/finalizers
   - botswarms/finalizers
   - scenarios/finalizers
   - submissions/finalizers
@@ -29,6 +43,7 @@ rules:
 - apiGroups:
   - ironbook.ironbook.io
   resources:
+  - benchmarkruns/status
   - botswarms/status
   - scenarios/status
   - submissions/status
