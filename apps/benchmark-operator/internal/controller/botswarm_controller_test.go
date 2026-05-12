@@ -51,7 +51,15 @@ var _ = Describe("BotSwarm Controller", func() {
 						Name:      resourceName,
 						Namespace: "default",
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: ironbookv1.BotSwarmSpec{
+						MaxWorkers: 4,
+						Protocols:  []string{"REST"},
+						OrderMix: ironbookv1.OrderMixProfile{
+							LimitFraction:  "0.7",
+							IocFraction:    "0.2",
+							CancelFraction: "0.1",
+						},
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}

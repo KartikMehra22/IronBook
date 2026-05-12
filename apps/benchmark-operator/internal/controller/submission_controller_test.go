@@ -51,7 +51,10 @@ var _ = Describe("Submission Controller", func() {
 						Name:      resourceName,
 						Namespace: "default",
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: ironbookv1.SubmissionSpec{
+						Sha256:   "0000000000000000000000000000000000000000000000000000000000000000",
+						Language: "rust",
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}
