@@ -1,0 +1,46 @@
+apiVersion: ironbook.ironbook.io/v1
+kind: Submission
+metadata:
+  name: hello-rust
+  namespace: default
+spec:
+  sha256: "2222222222222222222222222222222222222222222222222222222222222222"
+  language: rust
+---
+apiVersion: ironbook.ironbook.io/v1
+kind: Scenario
+metadata:
+  name: scenario-tiny
+  namespace: default
+spec:
+  yamlSpec: "name: tiny\nrate: 1000\n"
+  seed: 42
+  durationSeconds: 5
+  targets:
+    p50Us: 100
+    p99Us: 500
+    tps: 1000
+---
+apiVersion: ironbook.ironbook.io/v1
+kind: BotSwarm
+metadata:
+  name: small-swarm
+  namespace: default
+spec:
+  maxWorkers: 2
+  protocols: ["REST"]
+  orderMix:
+    limitFraction: "1.0"
+    iocFraction: "0.0"
+    cancelFraction: "0.0"
+---
+apiVersion: ironbook.ironbook.io/v1
+kind: BenchmarkRun
+metadata:
+  name: run-001
+  namespace: default
+spec:
+  submissionRef: { name: hello-rust }
+  scenarioRef:   { name: scenario-tiny }
+  botSwarmRef:   { name: small-swarm }
+  seed: 42

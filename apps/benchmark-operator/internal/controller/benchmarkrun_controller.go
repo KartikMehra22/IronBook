@@ -27,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -66,6 +67,7 @@ type BenchmarkRunReconciler struct {
 // +kubebuilder:rbac:groups=ironbook.ironbook.io,resources=scenarios,verbs=get;list;watch
 // +kubebuilder:rbac:groups=ironbook.ironbook.io,resources=botswarms,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile drives the state machine. Each transition method is idempotent.
 func (r *BenchmarkRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -166,6 +168,20 @@ func (r *BenchmarkRunReconciler) toPriming(ctx context.Context, br *ironbookv1.B
 		r.ensureCoordinatorPod,
 	} {
 		if err := fn(ctx, br, &sub, &scn); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	// Services give the four pods stable DNS names — the coordinator and
+	// the gateway both rely on cluster DNS to reach their peers.
+	for _, svc := range []struct {
+		role string
+		port int32
+	}{
+		{roleOracle, 7080},
+		{roleSubmission, 7777},
+		{roleGateway, 8080},
+	} {
+		if err := r.ensureService(ctx, br, svc.role, svc.port); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -298,18 +314,28 @@ func (r *BenchmarkRunReconciler) ensureGatewayPod(ctx context.Context, br *ironb
 		Spec: corev1.PodSpec{
 			RestartPolicy:   corev1.RestartPolicyNever,
 			SecurityContext: nonRootPodSecurityContext(),
+			Volumes: []corev1.Volume{{
+				// Writable scratch for the gateway's JSONL event log. The
+				// container's rootfs is read-only (PSA restricted), so the
+				// sink path lives on an ephemeral emptyDir.
+				Name:         "scratch",
+				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			}},
 			Containers: []corev1.Container{{
 				Name:            "gateway",
 				Image:           imgGateway,
 				ImagePullPolicy: corev1.PullIfNotPresent,
 				Ports:           []corev1.ContainerPort{{Name: "http", ContainerPort: 8080}},
 				SecurityContext: hardenedContainerSecurityContext(),
+				VolumeMounts: []corev1.VolumeMount{{
+					Name: "scratch", MountPath: "/var/log/ironbook",
+				}},
 				Env: []corev1.EnvVar{
 					{Name: "IRONBOOK_HTTP_ADDR", Value: ":8080"},
 					{Name: "IRONBOOK_TIME_SERVICE", Value: "time-service.ironbook.svc.cluster.local:7070"},
 					{Name: "IRONBOOK_SUBMISSION_ENDPOINT", Value: br.Status.SubmissionEndpoint},
 					{Name: "IRONBOOK_ORACLE_ENDPOINT", Value: br.Status.OracleEndpoint},
-					{Name: "IRONBOOK_EVENT_LOG_PATH", Value: "/tmp/events.jsonl"},
+					{Name: "IRONBOOK_EVENT_LOG_PATH", Value: "/var/log/ironbook/events.jsonl"},
 				},
 				Resources: smallResources(),
 			}},
@@ -346,6 +372,30 @@ func (r *BenchmarkRunReconciler) ensurePod(ctx context.Context, br *ironbookv1.B
 		return err
 	}
 	if err := r.Create(ctx, pod); err != nil && !apierrors.IsAlreadyExists(err) {
+		return err
+	}
+	return nil
+}
+
+// ensureService creates a ClusterIP Service that selects the pod owned by br
+// with the given role label, exposing port. The Service name matches the
+// host portion of the endpoint fields the reconciler stamps onto Status.
+func (r *BenchmarkRunReconciler) ensureService(ctx context.Context, br *ironbookv1.BenchmarkRun, role string, port int32) error {
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-%s", role, br.Name),
+			Namespace: br.Namespace,
+			Labels:    map[string]string{labelRun: br.Name, labelRole: role},
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{labelRun: br.Name, labelRole: role},
+			Ports:    []corev1.ServicePort{{Port: port, TargetPort: intstr.FromInt32(port)}},
+		},
+	}
+	if err := controllerutil.SetControllerReference(br, svc, r.Scheme); err != nil {
+		return err
+	}
+	if err := r.Create(ctx, svc); err != nil && !apierrors.IsAlreadyExists(err) {
 		return err
 	}
 	return nil
@@ -451,6 +501,7 @@ func (r *BenchmarkRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&ironbookv1.BenchmarkRun{}).
 		Owns(&corev1.Pod{}).
+		Owns(&corev1.Service{}).
 		Named("benchmarkrun").
 		Complete(r)
 }
