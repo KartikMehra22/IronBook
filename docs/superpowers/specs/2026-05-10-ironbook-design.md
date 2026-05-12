@@ -9,6 +9,23 @@
 | **Created** | 2026-05-10 |
 | **Repo** | github.com/<owner>/IronBook |
 | **Codename** | IronBook (order book + iron-clad correctness) |
+| **Implementation** | Submission pipeline + distributed run spine working end-to-end on kind (tag `v0.2`, 2026-05-13); telemetry, replay, hardening, and demo polish still to come. |
+
+### Implementation status — 2026-05-13
+
+Working end-to-end on a local kind cluster (tag `v0.2`):
+
+- 4 CRDs installed: `Submission`, `Scenario`, `BotSwarm`, `BenchmarkRun`.
+- Submission upload → content-addressed storage (MinIO + Postgres) → image build via Kaniko Jobs → status state machine (`PENDING` → `READY` / `REJECTED`).
+- Admission webhook enforcing `runtimeClassName: gvisor` on every submission pod; deny-by-default NetworkPolicies and seccomp profiles applied via the dev overlay.
+- `BenchmarkRun` reconciler driving the full 10-state lifecycle (`PENDING` → `ALLOCATING` → `PRIMING` → `RUNNING` → `DRAINING` → `COMPLETE`) with finalizer-driven cascade-delete of oracle / submission / gateway / coordinator pods + Services.
+- Matching engine + reference-oracle (Rust, gRPC under `tonic`) covered by 256-case property tests for fill conservation, no phantom makers, and monotonic trade IDs.
+- `time-service` issuing monotonic ns timestamps with a persisted high-watermark across restarts.
+- `fairness-gateway` (Go) stamping every order from `time-service`, fanning out to submission and oracle in parallel, and sinking events to a JSONL file the `telemetry-sidecar` tails.
+- `bot-coordinator` (Go) compiling a deterministic, seeded 5000-event schedule per run and dispatching to the gateway over REST.
+- E2E test (`tests/e2e/phase2/run_reaches_complete_test.go`, build tag `e2e`) drives a `BenchmarkRun` through every state and reaches `COMPLETE` in ~12 s on kind.
+
+Not yet implemented (next milestones): Redpanda + ClickHouse telemetry sink, deterministic replay engine and divergence detector, leaderboard frontend, chaos/anti-cheat hardening, and the recorded demo.
 
 ---
 
