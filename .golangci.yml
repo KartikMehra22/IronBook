@@ -1,0 +1,44 @@
+version: "2"
+
+run:
+  allow-parallel-runners: true
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - misspell
+    - unconvert
+    - bodyclose
+    - copyloopvar
+  settings:
+    errcheck:
+      exclude-functions:
+        - io.Copy
+        - (net/http.ResponseWriter).Write
+  exclusions:
+    generated: lax
+    rules:
+      - linters: [errcheck]
+        text: "Error return value of `.*\\.Close(Now)?` is not checked"
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+      - "apps/.*/internal/proto"
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
