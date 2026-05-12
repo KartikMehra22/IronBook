@@ -22,6 +22,9 @@ resources:
 # default, aiding admins in cluster management. Those roles are
 # not used by the benchmark-operator itself. You can comment the following lines
 # if you do not want those helpers be installed with your Project.
+- benchmarkrun_admin_role.yaml
+- benchmarkrun_editor_role.yaml
+- benchmarkrun_viewer_role.yaml
 - botswarm_admin_role.yaml
 - botswarm_editor_role.yaml
 - botswarm_viewer_role.yaml

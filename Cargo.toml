@@ -5,6 +5,8 @@ members = [
     "crates/proto",
     "crates/time-service",
     "crates/reference-oracle",
+    "crates/bot-worker",
+    "crates/telemetry-sidecar",
 ]
 resolver = "2"
 

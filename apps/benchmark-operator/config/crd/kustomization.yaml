@@ -5,6 +5,7 @@ resources:
 - bases/ironbook.ironbook.io_submissions.yaml
 - bases/ironbook.ironbook.io_scenarios.yaml
 - bases/ironbook.ironbook.io_botswarms.yaml
+- bases/ironbook.ironbook.io_benchmarkruns.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:
